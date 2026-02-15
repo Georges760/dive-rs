@@ -258,7 +258,7 @@ fn render_dive_info(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout
         right_col.push(format!(" Country:   {}", country));
     }
     if let Some(ref buddy) = dive.buddy {
-        left_col.push(format!(" Buddy:     {}", buddy));
+        left_col.push(format!(" Buddy/Ctr: {}", buddy));
     }
 
     // Pad columns to same length
@@ -352,18 +352,7 @@ fn render_depth_chart(frame: &mut ratatui::Frame, app: &App, area: ratatui::layo
 
     let mut datasets = Vec::new();
 
-    if app.show_depth {
-        datasets.push(
-            Dataset::default()
-                .name("Depth")
-                .marker(Marker::Braille)
-                .graph_type(GraphType::Line)
-                .style(Style::default().fg(Color::Cyan))
-                .data(&depth_data),
-        );
-    }
-
-    // Optional temperature overlay
+    // Optional temperature overlay (drawn first = bottom layer)
     let has_temp = app.show_temp && dive.samples.iter().any(|s| s.temp_c.is_some());
     let temp_data: Vec<(f64, f64)>;
     let temp_label: String;
@@ -402,7 +391,7 @@ fn render_depth_chart(frame: &mut ratatui::Frame, app: &App, area: ratatui::layo
         );
     }
 
-    // Optional pressure overlay
+    // Optional pressure overlay (drawn second = middle layer)
     let has_pressure = app.show_pressure && dive.samples.iter().any(|s| s.pressure_bar.is_some());
     let pressure_data: Vec<(f64, f64)>;
     let pressure_label: String;
@@ -429,7 +418,7 @@ fn render_depth_chart(frame: &mut ratatui::Frame, app: &App, area: ratatui::layo
             })
             .collect();
 
-        pressure_label = format!("Press ({:.0}-{:.0}bar)", pmin, pmax);
+        pressure_label = format!("Press ({:.0}-{:.0}bar)", pmax, pmin);
 
         datasets.push(
             Dataset::default()
@@ -438,6 +427,18 @@ fn render_depth_chart(frame: &mut ratatui::Frame, app: &App, area: ratatui::layo
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(Color::Green))
                 .data(&pressure_data),
+        );
+    }
+
+    // Depth (drawn last = top layer)
+    if app.show_depth {
+        datasets.push(
+            Dataset::default()
+                .name("Depth")
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Cyan))
+                .data(&depth_data),
         );
     }
 
