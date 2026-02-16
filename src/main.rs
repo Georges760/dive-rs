@@ -96,8 +96,8 @@ enum Commands {
         #[arg(short, long, default_value = "dives.json")]
         json: PathBuf,
 
-        /// Time offset in seconds applied to video capture time (positive = shift video time forward)
-        #[arg(short, long, default_value = "0")]
+        /// Time offset in seconds applied to video capture time (positive = shift video time forward, negative = shift back)
+        #[arg(short, long, default_value = "0", allow_hyphen_values = true)]
         offset: i64,
     },
 
