@@ -86,6 +86,21 @@ enum Commands {
         json: PathBuf,
     },
 
+    /// Overlay dive data (depth, temp, pressure) onto a video using ffmpeg
+    Watermark {
+        /// Path to the video file
+        #[arg(short, long)]
+        video: PathBuf,
+
+        /// Path to dives.json
+        #[arg(short, long, default_value = "dives.json")]
+        json: PathBuf,
+
+        /// Time offset in seconds applied to video capture time (positive = shift video time forward)
+        #[arg(short, long, default_value = "0")]
+        offset: i64,
+    },
+
     /// Parse previously downloaded raw dive data (offline, no BLE needed)
     Parse {
         /// Directory containing raw dive data (dive_NNN_header.bin / dive_NNN_profile.bin)
@@ -124,6 +139,11 @@ async fn main() -> Result<()> {
         Commands::Debug { address } => cmd_debug(address).await,
         Commands::View { input } => tui::run(input),
         Commands::Correlate { csv, json } => cmd_correlate(csv, json),
+        Commands::Watermark {
+            video,
+            json,
+            offset,
+        } => cmd_watermark(video, json, offset),
         Commands::Parse {
             raw_dir,
             output,
@@ -729,6 +749,289 @@ fn cmd_correlate(csv_path: PathBuf, json_path: PathBuf) -> Result<()> {
     std::fs::write(&json_path, &json)?;
     eprintln!("Updated {}", json_path.display());
 
+    Ok(())
+}
+
+// ── Watermark ──
+
+struct VideoMeta {
+    capture_time: chrono::NaiveDateTime,
+    width: u32,
+    height: u32,
+    duration_secs: f64,
+}
+
+fn probe_video(path: &std::path::Path) -> Result<VideoMeta> {
+    let output = std::process::Command::new("ffprobe")
+        .args(["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams"])
+        .arg(path)
+        .output()
+        .context("Failed to run ffprobe. Is ffmpeg installed?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ffprobe failed: {stderr}");
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("Failed to parse ffprobe JSON output")?;
+
+    // Extract capture time from format.tags.comment
+    let comment = json["format"]["tags"]["comment"]
+        .as_str()
+        .or_else(|| json["format"]["tags"]["Comment"].as_str())
+        .context("No 'comment' tag found in video metadata. Cannot determine capture time.")?;
+
+    let capture_time = chrono::DateTime::parse_from_str(comment.trim(), "%Y-%m-%d %H:%M:%S %z")
+        .with_context(|| format!("Failed to parse comment timestamp: {comment:?}"))?
+        .naive_utc();
+
+    // Find video stream for resolution and duration
+    let streams = json["streams"].as_array().context("No streams in ffprobe output")?;
+    let video_stream = streams
+        .iter()
+        .find(|s| s["codec_type"].as_str() == Some("video"))
+        .context("No video stream found")?;
+
+    let width = video_stream["width"]
+        .as_u64()
+        .context("No width in video stream")? as u32;
+    let height = video_stream["height"]
+        .as_u64()
+        .context("No height in video stream")? as u32;
+
+    let duration_secs = video_stream["duration"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| {
+            json["format"]["duration"]
+                .as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+        })
+        .context("No duration found in video metadata")?;
+
+    Ok(VideoMeta {
+        capture_time,
+        width,
+        height,
+        duration_secs,
+    })
+}
+
+fn find_overlapping_dive(
+    dives: &[DiveLog],
+    video_start: chrono::NaiveDateTime,
+    video_duration: f64,
+    offset: i64,
+) -> Result<&DiveLog> {
+    let video_start = video_start + chrono::Duration::seconds(offset);
+    let video_end = video_start + chrono::Duration::milliseconds((video_duration * 1000.0) as i64);
+
+    let mut best: Option<(&DiveLog, i64)> = None;
+
+    for dive in dives {
+        let dive_end = dive.datetime + chrono::Duration::seconds(dive.duration_seconds as i64);
+
+        let overlap_start = video_start.max(dive.datetime);
+        let overlap_end = video_end.min(dive_end);
+        let overlap = (overlap_end - overlap_start).num_seconds();
+
+        if overlap > 0 && (best.is_none() || overlap > best.unwrap().1) {
+            best = Some((dive, overlap));
+        }
+    }
+
+    match best {
+        Some((dive, overlap)) => {
+            eprintln!(
+                "Matched dive #{} ({}) — {:.0}s overlap",
+                dive.number,
+                dive.datetime.format("%Y-%m-%d %H:%M"),
+                overlap
+            );
+            Ok(dive)
+        }
+        None => {
+            let video_date = video_start.date();
+            eprintln!("Video time range: {} to {}", video_start, video_end);
+            let same_day: Vec<_> = dives
+                .iter()
+                .filter(|d| d.datetime.date() == video_date)
+                .collect();
+            if same_day.is_empty() {
+                eprintln!("No dives found on {video_date}.");
+            } else {
+                eprintln!("Dives on {video_date}:");
+                for dive in &same_day {
+                    let dive_end =
+                        dive.datetime + chrono::Duration::seconds(dive.duration_seconds as i64);
+                    eprintln!(
+                        "  #{}: {} to {}",
+                        dive.number,
+                        dive.datetime.format("%H:%M:%S"),
+                        dive_end.format("%H:%M:%S")
+                    );
+                }
+            }
+            anyhow::bail!(
+                "No dive overlaps with the video time range. \
+                 Use --offset to adjust (e.g. --offset 60 shifts video time forward by 60s)."
+            )
+        }
+    }
+}
+
+/// Escape a string for use in ffmpeg drawtext filter.
+fn escape_drawtext(s: &str) -> String {
+    s.replace('\\', r"\\")
+        .replace(':', r"\:")
+        .replace('\'', r"'\''")
+}
+
+fn build_drawtext_filter(
+    dive: &DiveLog,
+    video_start: chrono::NaiveDateTime,
+    video_duration: f64,
+    offset: i64,
+) -> String {
+    let video_start = video_start + chrono::Duration::seconds(offset);
+    let dive_start_offset = (video_start - dive.datetime).num_seconds();
+
+    let mut filters = Vec::new();
+
+    for (i, sample) in dive.samples.iter().enumerate() {
+        let sample_video_t = sample.time_s as f64 - dive_start_offset as f64;
+        let next_video_t = if i + 1 < dive.samples.len() {
+            dive.samples[i + 1].time_s as f64 - dive_start_offset as f64
+        } else {
+            video_duration
+        };
+
+        // Skip samples entirely outside the video
+        if next_video_t <= 0.0 || sample_video_t >= video_duration {
+            continue;
+        }
+
+        // Clamp to video boundaries
+        let start_t = sample_video_t.max(0.0);
+        let end_t = next_video_t.min(video_duration);
+
+        // Format text
+        let mut text = format!("-{:.1}m", sample.depth_m);
+        if let Some(temp) = sample.temp_c {
+            text.push_str(&format!("  {temp:.1}°C"));
+        }
+        if let Some(pressure) = sample.pressure_bar {
+            text.push_str(&format!("  {pressure:.0}bar"));
+        }
+
+        let escaped = escape_drawtext(&text);
+
+        filters.push(format!(
+            "drawtext=text='{escaped}'\
+            :fontcolor=white:fontsize=48\
+            :borderw=2:bordercolor=black\
+            :shadowcolor=black@0.5:shadowx=2:shadowy=2\
+            :x=W-tw-20:y=H-th-20\
+            :enable='between(t,{start_t:.3},{end_t:.3})'"
+        ));
+    }
+
+    if filters.is_empty() {
+        eprintln!("Warning: no dive samples fall within the video time range. Output will have no overlay.");
+        return String::new();
+    }
+
+    filters.join(",")
+}
+
+fn cmd_watermark(video: PathBuf, json: PathBuf, offset: i64) -> Result<()> {
+    // Load dives
+    let json_contents = std::fs::read_to_string(&json)
+        .with_context(|| format!("Failed to read {}", json.display()))?;
+    let data: DiveData = serde_json::from_str(&json_contents)
+        .with_context(|| format!("Failed to parse {}", json.display()))?;
+
+    if data.dives.is_empty() {
+        anyhow::bail!("No dives found in {}", json.display());
+    }
+
+    // Probe video
+    eprintln!("Probing video: {}", video.display());
+    let meta = probe_video(&video)?;
+    eprintln!(
+        "  Capture time: {} UTC",
+        meta.capture_time.format("%Y-%m-%d %H:%M:%S")
+    );
+    eprintln!("  Resolution: {}x{}", meta.width, meta.height);
+    eprintln!("  Duration: {:.1}s", meta.duration_secs);
+
+    if offset != 0 {
+        eprintln!("  Time offset: {offset}s");
+    }
+
+    // Find matching dive
+    let dive = find_overlapping_dive(&data.dives, meta.capture_time, meta.duration_secs, offset)?;
+
+    // Build filter
+    let filter = build_drawtext_filter(dive, meta.capture_time, meta.duration_secs, offset);
+
+    // Build output path: YYYY-MM-DD_HHhMM_Site_Name.ext
+    let ext = video.extension().unwrap_or_default().to_string_lossy();
+    let dt_str = dive.datetime.format("%Y-%m-%d_%Hh%M").to_string();
+    let output_name = match &dive.site {
+        Some(site) if !site.is_empty() => {
+            let safe_site = site.replace(' ', "_");
+            format!("{dt_str}_{safe_site}.{ext}")
+        }
+        _ => format!("{dt_str}_dive.{ext}"),
+    };
+    let output_path = video
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join(output_name);
+
+    if filter.is_empty() {
+        eprintln!("No overlay samples — copying video without modification.");
+        std::fs::copy(&video, &output_path)?;
+        eprintln!("Output: {}", output_path.display());
+        return Ok(());
+    }
+
+    eprintln!(
+        "Rendering overlay ({} drawtext filters, {:.1}KB filter string)...",
+        filter.matches("drawtext=").count(),
+        filter.len() as f64 / 1024.0
+    );
+
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-i"]).arg(&video);
+
+    // Use filter_script if the filter string is very large (>100KB)
+    let _tempfile;
+    if filter.len() > 100 * 1024 {
+        let tmp = std::env::temp_dir().join("sirius_dive_filter.txt");
+        std::fs::write(&tmp, &filter)?;
+        cmd.args(["-filter_script:v"]).arg(&tmp);
+        _tempfile = Some(tmp);
+    } else {
+        cmd.args(["-vf", &filter]);
+    }
+
+    cmd.args(["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-c:a", "copy",
+              "-map_metadata", "0", "-movflags", "+use_metadata_tags", "-y"])
+        .arg(&output_path);
+
+    eprintln!("Running ffmpeg...");
+    let status = cmd
+        .status()
+        .context("Failed to run ffmpeg. Is ffmpeg installed?")?;
+
+    if !status.success() {
+        anyhow::bail!("ffmpeg exited with status {status}");
+    }
+
+    eprintln!("Output: {}", output_path.display());
     Ok(())
 }
 
