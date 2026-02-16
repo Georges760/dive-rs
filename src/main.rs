@@ -776,15 +776,31 @@ fn probe_video(path: &std::path::Path) -> Result<VideoMeta> {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout)
         .context("Failed to parse ffprobe JSON output")?;
 
-    // Extract capture time from format.tags.comment
-    let comment = json["format"]["tags"]["comment"]
+    // Extract capture time from video metadata (try multiple tag formats)
+    let tags = &json["format"]["tags"];
+    let capture_time = if let Some(comment) = tags["comment"]
         .as_str()
-        .or_else(|| json["format"]["tags"]["Comment"].as_str())
-        .context("No 'comment' tag found in video metadata. Cannot determine capture time.")?;
-
-    let capture_time = chrono::DateTime::parse_from_str(comment.trim(), "%Y-%m-%d %H:%M:%S %z")
-        .with_context(|| format!("Failed to parse comment timestamp: {comment:?}"))?
-        .naive_utc();
+        .or_else(|| tags["Comment"].as_str())
+    {
+        // Insta360 X3: "2025-08-01 10:04:49 +0000"
+        chrono::DateTime::parse_from_str(comment.trim(), "%Y-%m-%d %H:%M:%S %z")
+            .with_context(|| format!("Failed to parse comment timestamp: {comment:?}"))?
+            .naive_utc()
+    } else if let Some(creation_time) = tags["creation_time"]
+        .as_str()
+        .or_else(|| tags["Creation_time"].as_str())
+    {
+        // GoPro / many other cameras: "2024-11-17T10:12:57.000000Z"
+        chrono::NaiveDateTime::parse_from_str(creation_time.trim(), "%Y-%m-%dT%H:%M:%S%.fZ")
+            .with_context(|| {
+                format!("Failed to parse creation_time timestamp: {creation_time:?}")
+            })?
+    } else {
+        anyhow::bail!(
+            "No capture time found in video metadata. \
+             Expected 'comment' (Insta360) or 'creation_time' (GoPro) tag."
+        );
+    };
 
     // Find video stream for resolution and duration
     let streams = json["streams"].as_array().context("No streams in ffprobe output")?;
@@ -893,9 +909,17 @@ fn build_drawtext_filter(
     video_start: chrono::NaiveDateTime,
     video_duration: f64,
     offset: i64,
+    video_height: u32,
 ) -> String {
     let video_start = video_start + chrono::Duration::seconds(offset);
     let dive_start_offset = (video_start - dive.datetime).num_seconds();
+
+    // Scale overlay relative to 1080p baseline
+    let scale = video_height as f64 / 1080.0;
+    let fontsize = (48.0 * scale).round() as u32;
+    let borderw = (2.0 * scale).round().max(1.0) as u32;
+    let shadow = (2.0 * scale).round().max(1.0) as u32;
+    let margin = (20.0 * scale).round() as u32;
 
     let mut filters = Vec::new();
 
@@ -929,10 +953,10 @@ fn build_drawtext_filter(
 
         filters.push(format!(
             "drawtext=text='{escaped}'\
-            :fontcolor=white:fontsize=48\
-            :borderw=2:bordercolor=black\
-            :shadowcolor=black@0.5:shadowx=2:shadowy=2\
-            :x=W-tw-20:y=H-th-20\
+            :fontcolor=white:fontsize={fontsize}\
+            :borderw={borderw}:bordercolor=black\
+            :shadowcolor=black@0.5:shadowx={shadow}:shadowy={shadow}\
+            :x=W-tw-{margin}:y=H-th-{margin}\
             :enable='between(t,{start_t:.3},{end_t:.3})'"
         ));
     }
@@ -974,11 +998,11 @@ fn cmd_watermark(video: PathBuf, json: PathBuf, offset: i64) -> Result<()> {
     let dive = find_overlapping_dive(&data.dives, meta.capture_time, meta.duration_secs, offset)?;
 
     // Build filter
-    let filter = build_drawtext_filter(dive, meta.capture_time, meta.duration_secs, offset);
+    let filter = build_drawtext_filter(dive, meta.capture_time, meta.duration_secs, offset, meta.height);
 
     // Build output path: YYYY-MM-DD_HHhMM_Site_Name.ext
     let ext = video.extension().unwrap_or_default().to_string_lossy();
-    let dt_str = dive.datetime.format("%Y-%m-%d_%Hh%M").to_string();
+    let dt_str = meta.capture_time.format("%Y-%m-%d_%Hh%M").to_string();
     let output_name = match &dive.site {
         Some(site) if !site.is_empty() => {
             let safe_site = site.replace(' ', "_");
