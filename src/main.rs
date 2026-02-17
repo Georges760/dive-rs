@@ -96,7 +96,10 @@ enum Commands {
         #[arg(short, long, default_value = "dives.json")]
         json: PathBuf,
 
-        /// Time offset in seconds applied to video capture time (positive = shift video time forward, negative = shift back)
+        /// Time offset in seconds added to dive log start time to correct for
+        /// missing second precision. Dive logs are truncated to the minute, so the
+        /// recorded start is typically 0–59s early. A positive offset shifts the
+        /// dive time forward (common case); a negative offset shifts it back (rare).
         #[arg(short, long, default_value = "0", allow_hyphen_values = true)]
         offset: i64,
     },
@@ -840,15 +843,15 @@ fn find_overlapping_dive(
     video_duration: f64,
     offset: i64,
 ) -> Result<&DiveLog> {
-    let video_start = video_start + chrono::Duration::seconds(offset);
     let video_end = video_start + chrono::Duration::milliseconds((video_duration * 1000.0) as i64);
 
     let mut best: Option<(&DiveLog, i64)> = None;
 
     for dive in dives {
-        let dive_end = dive.datetime + chrono::Duration::seconds(dive.duration_seconds as i64);
+        let dive_start = dive.datetime + chrono::Duration::seconds(offset);
+        let dive_end = dive_start + chrono::Duration::seconds(dive.duration_seconds as i64);
 
-        let overlap_start = video_start.max(dive.datetime);
+        let overlap_start = video_start.max(dive_start);
         let overlap_end = video_end.min(dive_end);
         let overlap = (overlap_end - overlap_start).num_seconds();
 
@@ -891,7 +894,7 @@ fn find_overlapping_dive(
             }
             anyhow::bail!(
                 "No dive overlaps with the video time range. \
-                 Use --offset to adjust (e.g. --offset 60 shifts video time forward by 60s)."
+                 Use --offset to adjust (e.g. --offset 30 shifts dive start forward by 30s)."
             )
         }
     }
@@ -911,8 +914,8 @@ fn build_drawtext_filter(
     offset: i64,
     video_height: u32,
 ) -> String {
-    let video_start = video_start + chrono::Duration::seconds(offset);
-    let dive_start_offset = (video_start - dive.datetime).num_seconds();
+    let dive_start = dive.datetime + chrono::Duration::seconds(offset);
+    let dive_start_offset = (video_start - dive_start).num_seconds();
 
     // Scale overlay relative to 1080p baseline
     let scale = video_height as f64 / 1080.0;
@@ -991,7 +994,7 @@ fn cmd_watermark(video: PathBuf, json: PathBuf, offset: i64) -> Result<()> {
     eprintln!("  Duration: {:.1}s", meta.duration_secs);
 
     if offset != 0 {
-        eprintln!("  Time offset: {offset}s");
+        eprintln!("  Time offset: +{offset}s applied to dive time");
     }
 
     // Find matching dive
