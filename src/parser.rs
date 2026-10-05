@@ -102,7 +102,7 @@ pub fn parse_dive_ecop(dive_index: u32, header: &[u8], profile: &[u8]) -> Result
 
     // Duration: GENIUS uses fixed 5-second sample interval
     let sample_interval = 5u32;
-    let duration_seconds = nsamples * sample_interval - surftime_min * 60;
+    let duration_seconds = (nsamples * sample_interval).saturating_sub(surftime_min * 60);
 
     // Gas mixes at 0x54 (5 entries, 20 bytes each)
     let mut gas_mixes = Vec::new();

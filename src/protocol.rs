@@ -20,7 +20,7 @@ const CMD_SET_DATETIME: u8 = 0xB0; // Set device date/time (C_SET_DATETIME)
 // SDO response status codes (byte 0 of BF response)
 const SDO_SEGMENTED: u8 = 0x41; // Data too large for response, use AC/FE segments
 const SDO_EXPEDITED: u8 = 0x42; // Data fits in response (12 bytes)
-const SDO_ABORT: u8 = 0x80; // Object not found / abort
+const SDO_ABORT: u8 = 0x80; // Abort, bytes 4-7 = LE u32 CANopen abort code
 
 const VERSION_SIZE: usize = 140;
 const TIMEOUT_MS: u64 = 5000;
@@ -36,6 +36,44 @@ pub fn hex_dump(data: &[u8]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+/// The device refused an SDO upload (BF response status 0x80).
+/// The link is still usable afterwards, unlike a transport error.
+#[derive(Debug)]
+pub struct SdoAbort {
+    pub index: u16,
+    pub sub_index: u8,
+    /// CANopen (CiA 301) abort code
+    pub code: u32,
+}
+
+impl SdoAbort {
+    fn reason(&self) -> &'static str {
+        match self.code {
+            0x0602_0000 => "object does not exist",
+            0x0609_0011 => "sub-index does not exist",
+            // Returned for dive indexes past the end of the logbook
+            0x0800_0000 => "general error",
+            0x0800_0020 => "data cannot be transferred",
+            _ => "unknown abort code",
+        }
+    }
+}
+
+impl std::fmt::Display for SdoAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SDO abort: object 0x{:04X} sub {}: {} (0x{:08X})",
+            self.index,
+            self.sub_index,
+            self.reason(),
+            self.code
+        )
+    }
+}
+
+impl std::error::Error for SdoAbort {}
 
 /// Send a command with no payload using VARIABLE packet mode.
 /// Returns the data between ACK and END.
@@ -234,10 +272,16 @@ pub async fn ecop_read(
 
     match status {
         SDO_ABORT => {
-            bail!(
-                "SDO abort: object 0x{index:04X} sub {sub_index} not found [{}]",
-                hex_dump(ecop)
-            );
+            let code = match ecop.get(4..8) {
+                Some(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                None => 0,
+            };
+            Err(SdoAbort {
+                index,
+                sub_index,
+                code,
+            }
+            .into())
         }
         SDO_EXPEDITED => {
             // Data is directly in bytes 4..16 of ecop response

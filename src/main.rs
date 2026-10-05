@@ -68,6 +68,25 @@ enum Commands {
         address: Option<String>,
     },
 
+    /// Read raw SDO objects and hex-dump them (protocol exploration)
+    Sdo {
+        /// Object index, e.g. 0x3014 (dive index 20)
+        #[arg(value_parser = parse_u16)]
+        index: u16,
+
+        /// Sub-indexes to read, in order
+        #[arg(required = true)]
+        subs: Vec<u8>,
+
+        /// BLE device address. If omitted, connects to first Mares device found.
+        #[arg(short, long)]
+        address: Option<String>,
+
+        /// Save each object to <DIR>/<index>_<sub>.bin
+        #[arg(long)]
+        save: Option<PathBuf>,
+    },
+
     /// View dive logs in an interactive TUI (offline, no BLE needed)
     View {
         /// Input JSON file with dive data
@@ -126,6 +145,13 @@ enum OutputFormat {
     Csv,
 }
 
+fn parse_u16(s: &str) -> Result<u16, std::num::ParseIntError> {
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u16::from_str_radix(hex, 16),
+        None => s.parse(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -140,6 +166,12 @@ async fn main() -> Result<()> {
             save_raw,
         } => cmd_download(address, output, format, save_raw).await,
         Commands::Debug { address } => cmd_debug(address).await,
+        Commands::Sdo {
+            index,
+            subs,
+            address,
+            save,
+        } => cmd_sdo(address, index, subs, save).await,
         Commands::View { input } => tui::run(input),
         Commands::Correlate { csv, json } => cmd_correlate(csv, json),
         Commands::Watermark {
@@ -198,6 +230,43 @@ async fn cmd_scan(timeout_secs: u64, enumerate: bool) -> Result<()> {
         dev.peripheral.disconnect().await?;
     }
 
+    Ok(())
+}
+
+// ── Sdo ──
+
+async fn cmd_sdo(
+    address: Option<String>,
+    index: u16,
+    subs: Vec<u8>,
+    save: Option<PathBuf>,
+) -> Result<()> {
+    let adapter = ble::get_adapter().await?;
+    let peripheral = find_device(&adapter, address.as_deref()).await?;
+    let mut conn = ble::connect(&peripheral, None, None).await?;
+    protocol::get_device_info(&mut conn).await?;
+
+    for sub in subs {
+        match protocol::ecop_read(&mut conn, index, sub).await {
+            Ok(data) => {
+                println!("0x{index:04X} sub {sub}: {} bytes", data.len());
+                for (i, row) in data.chunks(16).enumerate() {
+                    println!("  {:04X}  {}", i * 16, protocol::hex_dump(row));
+                }
+                if let Some(ref dir) = save {
+                    std::fs::create_dir_all(dir)?;
+                    std::fs::write(dir.join(format!("{index:04X}_{sub}.bin")), &data)?;
+                }
+            }
+            Err(e) if e.is::<protocol::SdoAbort>() => println!("{e}"),
+            Err(e) => {
+                conn.disconnect().await.ok();
+                return Err(e);
+            }
+        }
+    }
+
+    conn.disconnect().await?;
     Ok(())
 }
 
@@ -419,48 +488,67 @@ async fn cmd_download(
     let mut new_dives = Vec::new();
     let mut skipped = 0u32;
 
-    for i in 0..dive_count {
-        eprint!("\rChecking dive {}/{}...", i + 1, dive_count);
+    // An error part-way through must not lose the dives fetched so far
+    let result: Result<()> = async {
+        for i in 0..dive_count {
+            eprint!("\rChecking dive {}/{}...", i + 1, dive_count);
 
-        let header = protocol::read_dive_header(&mut conn, i).await?;
+            let header = protocol::read_dive_header(&mut conn, i).await?;
 
-        // Check if we already have this dive
-        let dive_number = parser::dive_number_from_header(&header);
-        if existing_numbers.contains(&dive_number) {
-            eprintln!("\r  Dive #{}: already downloaded, skipping", dive_number);
-            skipped += 1;
-            continue;
-        }
-
-        eprint!("\rDownloading dive {}/{}...", i + 1, dive_count);
-        let profile = protocol::read_dive_profile(&mut conn, i).await?;
-
-        if let Some(ref raw_dir) = save_raw {
-            std::fs::create_dir_all(raw_dir)?;
-            std::fs::write(raw_dir.join(format!("dive_{i:03}_header.bin")), &header)?;
-            std::fs::write(raw_dir.join(format!("dive_{i:03}_profile.bin")), &profile)?;
-        }
-
-        match parser::parse_dive_ecop(i as u32, &header, &profile) {
-            Ok(dive) => {
-                eprintln!(
-                    "\r  Dive #{}: {} | {:.1}m | {}s | {} samples",
-                    dive.number,
-                    dive.datetime.format("%Y-%m-%d %H:%M"),
-                    dive.max_depth_m,
-                    dive.duration_seconds,
-                    dive.samples.len(),
-                );
-                new_dives.push(dive);
+            // Check if we already have this dive
+            let dive_number = parser::dive_number_from_header(&header);
+            if existing_numbers.contains(&dive_number) {
+                eprintln!("\r  Dive #{}: already downloaded, skipping", dive_number);
+                skipped += 1;
+                continue;
             }
-            Err(e) => {
-                eprintln!("\r  Dive {i}: parse error: {e}");
+
+            eprint!("\rDownloading dive {}/{}...", i + 1, dive_count);
+            let profile = match protocol::read_dive_profile(&mut conn, i).await {
+                Ok(profile) => profile,
+                // The watch lists the dive but refuses to hand over its profile
+                Err(e) if e.is::<protocol::SdoAbort>() => {
+                    eprintln!("\r  Dive #{dive_number}: no profile available, skipping ({e})");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            if let Some(ref raw_dir) = save_raw {
+                std::fs::create_dir_all(raw_dir)?;
+                std::fs::write(raw_dir.join(format!("dive_{i:03}_header.bin")), &header)?;
+                std::fs::write(raw_dir.join(format!("dive_{i:03}_profile.bin")), &profile)?;
+            }
+
+            match parser::parse_dive_ecop(i as u32, &header, &profile) {
+                Ok(dive) => {
+                    eprintln!(
+                        "\r  Dive #{}: {} | {:.1}m | {}s | {} samples",
+                        dive.number,
+                        dive.datetime.format("%Y-%m-%d %H:%M"),
+                        dive.max_depth_m,
+                        dive.duration_seconds,
+                        dive.samples.len(),
+                    );
+                    new_dives.push(dive);
+                }
+                Err(e) => {
+                    eprintln!("\r  Dive {i}: parse error: {e}");
+                }
             }
         }
+        Ok(())
     }
+    .await;
     eprintln!();
 
-    conn.disconnect().await?;
+    match &result {
+        Ok(()) => conn.disconnect().await?,
+        Err(e) => {
+            eprintln!("Download interrupted: {e:#}");
+            conn.disconnect().await.ok();
+        }
+    }
 
     if skipped > 0 {
         eprintln!("Skipped {} already-downloaded dive(s)", skipped);
@@ -476,7 +564,7 @@ async fn cmd_download(
 
     if all_dives.is_empty() {
         eprintln!("No dives could be parsed.");
-        return Ok(());
+        return result;
     }
 
     // Export
@@ -502,7 +590,7 @@ async fn cmd_download(
         }
     }
 
-    Ok(())
+    result
 }
 
 // ── Parse (offline) ──
