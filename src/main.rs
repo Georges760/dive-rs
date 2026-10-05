@@ -1,4 +1,5 @@
 mod ble;
+mod dsx;
 mod fit;
 mod parser;
 mod protocol;
@@ -83,6 +84,12 @@ enum Commands {
         /// Save each object to <DIR>/<index>_<sub>.bin and shorten the hex dump
         #[arg(long)]
         save: Option<PathBuf>,
+    },
+
+    /// Apeks DSX commands (experimental, not yet tested on a device)
+    Dsx {
+        #[command(subcommand)]
+        command: DsxCommand,
     },
 
     /// View dive logs in an interactive TUI (offline, no BLE needed)
@@ -181,6 +188,47 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum DsxCommand {
+    /// Pair with the DSX and store the access code it hands out
+    Pair {
+        /// BLE device address. If omitted, connects to first DSX found.
+        #[arg(short, long)]
+        address: Option<String>,
+
+        /// 6-digit passcode to send. If omitted, one is generated the way DiverLog+ does.
+        #[arg(long)]
+        passcode: Option<String>,
+    },
+
+    /// Connect and show device info and logbook pointers
+    Info {
+        /// BLE device address. If omitted, connects to first DSX found.
+        #[arg(short, long)]
+        address: Option<String>,
+    },
+
+    /// Download dive logs from the DSX
+    Download {
+        /// BLE device address. If omitted, connects to first DSX found.
+        #[arg(short, long)]
+        address: Option<String>,
+
+        /// Output file path (kept apart from the Sirius log: dive numbers overlap)
+        #[arg(short, long, default_value = "dsx_dives.json")]
+        output: PathBuf,
+
+        /// Save the raw logbook entries and profiles for debugging
+        #[arg(long)]
+        save_raw: Option<PathBuf>,
+
+        /// Leave out dives older than this day, as YYYY-MM-DD: those of a
+        /// former owner of the DSX. Remembered for this device.
+        #[arg(long)]
+        since: Option<chrono::NaiveDate>,
+    },
+}
+
 #[derive(Clone, ValueEnum)]
 enum OutputFormat {
     Json,
@@ -239,6 +287,7 @@ async fn main() -> Result<()> {
             address,
             save,
         } => cmd_sdo(address, objects, save).await,
+        Commands::Dsx { command } => cmd_dsx(command).await,
         Commands::View { input } => tui::run(input),
         Commands::Correlate { ssi, json } => cmd_correlate(ssi, json),
         Commands::Watermark {
@@ -269,11 +318,11 @@ async fn main() -> Result<()> {
 async fn cmd_scan(timeout_secs: u64, enumerate: bool) -> Result<()> {
     let adapter = ble::get_adapter().await?;
 
-    eprintln!("Scanning for Mares BLE devices ({timeout_secs}s)...");
+    eprintln!("Scanning for Mares and Apeks DSX devices ({timeout_secs}s)...");
     let devices = ble::scan_for_devices(&adapter, Duration::from_secs(timeout_secs)).await?;
 
     if devices.is_empty() {
-        eprintln!("No Mares devices found. Make sure the dive computer is in Bluetooth mode.");
+        eprintln!("No supported devices found. Make sure the dive computer is in Bluetooth mode.");
         return Ok(());
     }
 
@@ -318,7 +367,7 @@ async fn cmd_sdo(
     save: Option<PathBuf>,
 ) -> Result<()> {
     let adapter = ble::get_adapter().await?;
-    let peripheral = find_device(&adapter, address.as_deref()).await?;
+    let peripheral = find_device(&adapter, address.as_deref(), ble::DeviceKind::Mares).await?;
     let mut conn = ble::connect(&peripheral, None, None).await?;
     protocol::get_device_info(&mut conn).await?;
 
@@ -353,11 +402,41 @@ async fn cmd_sdo(
     Ok(())
 }
 
+// ── DSX ──
+
+async fn cmd_dsx(command: DsxCommand) -> Result<()> {
+    let address = match &command {
+        DsxCommand::Pair { address, .. }
+        | DsxCommand::Info { address }
+        | DsxCommand::Download { address, .. } => address.clone(),
+    };
+
+    let adapter = ble::get_adapter().await?;
+    let peripheral = find_device(&adapter, address.as_deref(), ble::DeviceKind::Dsx).await?;
+    // The access code is stored under the advertised name ("GA" + serial)
+    let name = peripheral
+        .properties()
+        .await?
+        .and_then(|props| props.local_name)
+        .context("The DSX did not report a name")?;
+
+    match command {
+        DsxCommand::Pair { passcode, .. } => dsx::cmd_pair(&peripheral, &name, passcode).await,
+        DsxCommand::Info { .. } => dsx::cmd_info(&peripheral, &name).await,
+        DsxCommand::Download {
+            output,
+            save_raw,
+            since,
+            ..
+        } => dsx::cmd_download(&peripheral, &name, output, save_raw, since).await,
+    }
+}
+
 // ── Debug ──
 
 async fn cmd_debug(address: Option<String>) -> Result<()> {
     let adapter = ble::get_adapter().await?;
-    let peripheral = find_device(&adapter, address.as_deref()).await?;
+    let peripheral = find_device(&adapter, address.as_deref(), ble::DeviceKind::Mares).await?;
     let mut conn = ble::connect(&peripheral, None, None).await?;
 
     eprintln!("=== ECOP SDO Protocol Test ===\n");
@@ -477,7 +556,7 @@ async fn cmd_debug(address: Option<String>) -> Result<()> {
 
 async fn cmd_info(address: Option<String>) -> Result<()> {
     let adapter = ble::get_adapter().await?;
-    let peripheral = find_device(&adapter, address.as_deref()).await?;
+    let peripheral = find_device(&adapter, address.as_deref(), ble::DeviceKind::Mares).await?;
     let mut conn = ble::connect(&peripheral, None, None).await?;
 
     let info = protocol::get_device_info(&mut conn).await?;
@@ -547,7 +626,7 @@ async fn cmd_download(
     }
 
     let adapter = ble::get_adapter().await?;
-    let peripheral = find_device(&adapter, address.as_deref()).await?;
+    let peripheral = find_device(&adapter, address.as_deref(), ble::DeviceKind::Mares).await?;
     let mut conn = ble::connect(&peripheral, None, None).await?;
 
     let info = protocol::get_device_info(&mut conn).await?;
@@ -1579,12 +1658,21 @@ fn cmd_fit(
 async fn find_device(
     adapter: &btleplug::platform::Adapter,
     address: Option<&str>,
+    kind: ble::DeviceKind,
 ) -> Result<btleplug::platform::Peripheral> {
-    eprintln!("Scanning for Mares devices...");
-    let devices = ble::scan_for_devices(adapter, Duration::from_secs(10)).await?;
+    let family = match kind {
+        ble::DeviceKind::Mares => "Mares",
+        ble::DeviceKind::Dsx => "Apeks DSX",
+    };
+    eprintln!("Scanning for {family} devices...");
+    let devices: Vec<_> = ble::scan_for_devices(adapter, Duration::from_secs(10))
+        .await?
+        .into_iter()
+        .filter(|d| d.kind == kind)
+        .collect();
 
     if devices.is_empty() {
-        anyhow::bail!("No Mares devices found. Make sure the dive computer is in Bluetooth mode.");
+        anyhow::bail!("No {family} devices found. Make sure the dive computer is in Bluetooth mode.");
     }
 
     let dev = if let Some(addr) = address {

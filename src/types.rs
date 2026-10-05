@@ -46,7 +46,7 @@ impl Model {
     }
 }
 
-/// Dive mode from the GENIUS settings field.
+/// Dive mode, from the GENIUS settings field or the DSX logbook entry.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DiveMode {
@@ -55,6 +55,7 @@ pub enum DiveMode {
     Gauge,
     Nitrox,
     Freedive,
+    Ccr,
 }
 
 /// Water type set on the watch.

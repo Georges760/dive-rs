@@ -551,6 +551,7 @@ fn mode_short(mode: &DiveMode) -> &'static str {
         DiveMode::Nitrox => "Nx",
         DiveMode::Gauge => "Gau",
         DiveMode::Freedive => "Free",
+        DiveMode::Ccr => "CCR",
     }
 }
 

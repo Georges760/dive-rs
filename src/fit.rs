@@ -40,6 +40,7 @@ const SUB_SPORT_SINGLE_GAS: u8 = 53;
 const SUB_SPORT_MULTI_GAS: u8 = 54;
 const SUB_SPORT_GAUGE: u8 = 55;
 const SUB_SPORT_APNEA: u8 = 56;
+const SUB_SPORT_CCR: u8 = 63;
 
 /// A field value; the variant is its FIT base type.
 #[derive(Debug, Clone, Copy)]
@@ -194,6 +195,7 @@ fn sub_sport(dive: &DiveLog) -> u8 {
     match dive.dive_mode {
         DiveMode::Gauge => SUB_SPORT_GAUGE,
         DiveMode::Freedive => SUB_SPORT_APNEA,
+        DiveMode::Ccr => SUB_SPORT_CCR,
         DiveMode::Air | DiveMode::Nitrox if dive.gas_mixes.len() > 1 => SUB_SPORT_MULTI_GAS,
         DiveMode::Air | DiveMode::Nitrox => SUB_SPORT_SINGLE_GAS,
     }
@@ -1042,6 +1044,8 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(sub_sport(&dive), SUB_SPORT_MULTI_GAS);
+        dive.dive_mode = DiveMode::Ccr;
+        assert_eq!(sub_sport(&dive), SUB_SPORT_CCR);
         dive.dive_mode = DiveMode::Gauge;
         assert_eq!(sub_sport(&dive), SUB_SPORT_GAUGE);
     }

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use btleplug::api::{
-    Central, CentralEvent, Characteristic, Manager as _, Peripheral as _, ScanFilter,
+    Central, CentralEvent, CharPropFlags, Characteristic, Manager as _, Peripheral as _, ScanFilter,
     WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
@@ -29,10 +29,18 @@ const MARES_NAME_PREFIXES: &[&str] = &[
     "Puck",
 ];
 
+/// Which protocol family a discovered device speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    Mares,
+    Dsx,
+}
+
 /// Discovered BLE device info.
 #[derive(Debug)]
 pub struct DiscoveredDevice {
     pub name: String,
+    pub kind: DeviceKind,
     pub address: String,
     pub rssi: Option<i16>,
     pub peripheral: Peripheral,
@@ -74,7 +82,7 @@ pub async fn get_adapter() -> Result<Adapter> {
         .context("No BLE adapters found")
 }
 
-/// Scan for Mares BLE devices.
+/// Scan for supported BLE dive computers.
 pub async fn scan_for_devices(
     adapter: &Adapter,
     timeout: Duration,
@@ -106,7 +114,7 @@ pub async fn scan_for_devices(
                 if let Ok(peripheral) = adapter.peripheral(&id).await {
                     if let Ok(Some(props)) = peripheral.properties().await {
                         if let Some(ref name) = props.local_name {
-                            if is_mares_device(name) {
+                            if device_kind(name).is_some() {
                                 found_addresses.insert(id);
                                 eprintln!(
                                     "  Found: {} [{}] RSSI: {}",
@@ -135,9 +143,10 @@ pub async fn scan_for_devices(
     for p in peripherals {
         if let Ok(Some(props)) = p.properties().await {
             if let Some(ref name) = props.local_name {
-                if is_mares_device(name) {
+                if let Some(kind) = device_kind(name) {
                     devices.push(DiscoveredDevice {
                         name: name.clone(),
+                        kind,
                         address: props.address.to_string(),
                         rssi: props.rssi,
                         peripheral: p,
@@ -255,6 +264,20 @@ impl BleConnection {
         Ok(())
     }
 
+    /// Write a whole packet in one GATT write, for protocols whose packets
+    /// must not be split (the DSX).
+    pub async fn write_packet(&self, data: &[u8]) -> Result<()> {
+        let write_type = if self.write_char.properties.contains(CharPropFlags::WRITE) {
+            WriteType::WithResponse
+        } else {
+            WriteType::WithoutResponse
+        };
+        self.peripheral
+            .write(&self.write_char, data, write_type)
+            .await
+            .context("BLE write failed")
+    }
+
     /// Receive the next notification packet with timeout.
     pub async fn recv(&mut self, timeout_ms: u64) -> Result<Vec<u8>> {
         match time::timeout(Duration::from_millis(timeout_ms), self.rx.recv()).await {
@@ -310,6 +333,22 @@ impl BleConnection {
             .context("Failed to disconnect")?;
         Ok(())
     }
+}
+
+fn device_kind(name: &str) -> Option<DeviceKind> {
+    if is_mares_device(name) {
+        Some(DeviceKind::Mares)
+    } else if is_dsx_device(name) {
+        Some(DeviceKind::Dsx)
+    } else {
+        None
+    }
+}
+
+/// The Apeks DSX advertises its model code "GA" followed by its serial number.
+fn is_dsx_device(name: &str) -> bool {
+    name.strip_prefix("GA")
+        .is_some_and(|serial| !serial.is_empty() && serial.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn is_mares_device(name: &str) -> bool {
