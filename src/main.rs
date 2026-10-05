@@ -117,6 +117,12 @@ enum Commands {
         /// dive time forward (common case); a negative offset shifts it back (rare).
         #[arg(short, long, default_value = "0", allow_hyphen_values = true)]
         offset: i64,
+
+        /// Start time of the video on the dive computer's clock, as
+        /// "YYYY-MM-DD HH:MM[:SS]". Replaces the capture time stored in the
+        /// video, for a camera clock that was wrong or an export without one.
+        #[arg(short, long, value_parser = parse_start_time)]
+        start: Option<chrono::NaiveDateTime>,
     },
 
     /// Parse previously downloaded raw dive data (offline, no BLE needed)
@@ -139,6 +145,13 @@ enum Commands {
 enum OutputFormat {
     Json,
     Csv,
+}
+
+fn parse_start_time(s: &str) -> Result<chrono::NaiveDateTime, String> {
+    ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"]
+        .iter()
+        .find_map(|format| chrono::NaiveDateTime::parse_from_str(s, format).ok())
+        .ok_or_else(|| "expected \"YYYY-MM-DD HH:MM[:SS]\"".to_string())
 }
 
 fn parse_u16(s: &str) -> Result<u16, std::num::ParseIntError> {
@@ -192,7 +205,8 @@ async fn main() -> Result<()> {
             video,
             json,
             offset,
-        } => cmd_watermark(video, json, offset),
+            start,
+        } => cmd_watermark(video, json, offset, start),
         Commands::Parse {
             raw_dir,
             output,
@@ -885,7 +899,7 @@ struct VideoMeta {
     duration_secs: f64,
 }
 
-fn probe_video(path: &std::path::Path) -> Result<VideoMeta> {
+fn probe_video(path: &std::path::Path, start: Option<chrono::NaiveDateTime>) -> Result<VideoMeta> {
     let output = std::process::Command::new("ffprobe")
         .args(["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams"])
         .arg(path)
@@ -900,9 +914,12 @@ fn probe_video(path: &std::path::Path) -> Result<VideoMeta> {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout)
         .context("Failed to parse ffprobe JSON output")?;
 
-    // Extract capture time from video metadata (try multiple tag formats)
+    // Extract capture time from video metadata (try multiple tag formats),
+    // unless the caller knows better
     let tags = &json["format"]["tags"];
-    let capture_time = if let Some(comment) = tags["comment"]
+    let capture_time = if let Some(start) = start {
+        start
+    } else if let Some(comment) = tags["comment"]
         .as_str()
         .or_else(|| tags["Comment"].as_str())
     {
@@ -922,7 +939,8 @@ fn probe_video(path: &std::path::Path) -> Result<VideoMeta> {
     } else {
         anyhow::bail!(
             "No capture time found in video metadata. \
-             Expected 'comment' (Insta360) or 'creation_time' (GoPro) tag."
+             Expected 'comment' (Insta360) or 'creation_time' (GoPro) tag. \
+             Give the start time with --start instead."
         );
     };
 
@@ -1093,7 +1111,12 @@ fn build_drawtext_filter(
     filters.join(",")
 }
 
-fn cmd_watermark(video: PathBuf, json: PathBuf, offset: i64) -> Result<()> {
+fn cmd_watermark(
+    video: PathBuf,
+    json: PathBuf,
+    offset: i64,
+    start: Option<chrono::NaiveDateTime>,
+) -> Result<()> {
     // Load dives
     let json_contents = std::fs::read_to_string(&json)
         .with_context(|| format!("Failed to read {}", json.display()))?;
@@ -1106,11 +1129,18 @@ fn cmd_watermark(video: PathBuf, json: PathBuf, offset: i64) -> Result<()> {
 
     // Probe video
     eprintln!("Probing video: {}", video.display());
-    let meta = probe_video(&video)?;
-    eprintln!(
-        "  Capture time: {} UTC",
-        meta.capture_time.format("%Y-%m-%d %H:%M:%S")
-    );
+    let meta = probe_video(&video, start)?;
+    if start.is_some() {
+        eprintln!(
+            "  Start time: {} (from --start)",
+            meta.capture_time.format("%Y-%m-%d %H:%M:%S")
+        );
+    } else {
+        eprintln!(
+            "  Capture time: {} UTC",
+            meta.capture_time.format("%Y-%m-%d %H:%M:%S")
+        );
+    }
     eprintln!("  Resolution: {}x{}", meta.width, meta.height);
     eprintln!("  Duration: {:.1}s", meta.duration_secs);
 
@@ -1138,6 +1168,14 @@ fn cmd_watermark(video: PathBuf, json: PathBuf, offset: i64) -> Result<()> {
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .join(output_name);
+
+    // The output is named like hand-named clips: never write over the input
+    if std::fs::canonicalize(&output_path).ok() == std::fs::canonicalize(&video).ok() {
+        anyhow::bail!(
+            "The output would overwrite the input ({}). Rename or move the input first.",
+            output_path.display()
+        );
+    }
 
     if filter.is_empty() {
         eprintln!("No overlay samples — copying video without modification.");
