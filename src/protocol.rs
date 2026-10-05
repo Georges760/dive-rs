@@ -343,12 +343,11 @@ pub async fn ecop_read(
 }
 
 /// Send C_SET_DATETIME command to set the device's clock.
-/// The payload is a 4-byte LE Unix timestamp.
+/// The payload is a 4-byte LE timestamp: seconds since 1970 of the local
+/// wall-clock time, not of UTC (the watch has no timezone; this is what the
+/// SSI app sends).
 pub async fn set_datetime(conn: &mut BleConnection) -> Result<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as u32;
+    let now = chrono::Local::now().naive_local().and_utc().timestamp() as u32;
 
     let payload = now.to_le_bytes();
     eprintln!(
