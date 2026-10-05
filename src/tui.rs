@@ -212,11 +212,12 @@ fn render_dive_info(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Temperature range from samples
+    // Temperature range from samples, or from the dips of a freedive session
     let (temp_min, temp_max) = dive
         .samples
         .iter()
         .filter_map(|s| s.temp_c)
+        .chain(dive.dips.iter().filter_map(|d| d.min_temp_c))
         .fold((f64::MAX, f64::MIN), |(min, max), t| {
             (min.min(t), max.max(t))
         });
@@ -239,9 +240,11 @@ fn render_dive_info(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout
         format!(" Max depth: {:.1} m", dive.max_depth_m),
     ];
 
-    let mut right_col: Vec<String> = vec![
-        format!(" Gas:       {}", gas_str),
-    ];
+    let mut right_col: Vec<String> = vec![if dive.dips.is_empty() {
+        format!(" Gas:       {}", gas_str)
+    } else {
+        format!(" Dips:      {}", dive.dips.len())
+    }];
 
     if temp_min != f64::MAX {
         right_col.push(format!(" Temp:      {:.1} - {:.1} C", temp_min, temp_max));
@@ -277,10 +280,11 @@ fn render_dive_info(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout
                 format!("{:?}", dive.dive_mode),
                 Style::default().fg(Color::Yellow),
             ),
-            Span::raw(format!(
-                "    ({} samples)",
-                dive.samples.len()
-            )),
+            Span::raw(if dive.dips.is_empty() {
+                format!("    ({} samples)", dive.samples.len())
+            } else {
+                format!("    ({} dips)", dive.dips.len())
+            }),
         ]),
     ];
 
@@ -299,11 +303,50 @@ fn render_dive_info(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout
     frame.render_widget(paragraph, area);
 }
 
+/// Freedive sessions have no depth samples: list the dips instead of a chart.
+fn render_dips_table(frame: &mut ratatui::Frame, dive: &DiveLog, area: ratatui::layout::Rect) {
+    let mut lines = vec![Line::from(Span::styled(
+        "   #   Start   Depth    Time   Surface    Temp",
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+
+    // Start times are rebuilt by adding up surface and dive times
+    let mut start_s = 0;
+    for (i, dip) in dive.dips.iter().enumerate() {
+        start_s += dip.surface_s;
+        let temp = dip
+            .min_temp_c
+            .map(|t| format!("{t:.1} C"))
+            .unwrap_or_default();
+        lines.push(Line::from(format!(
+            "  {:>2}  {:>3}:{:02}  {:>5.1} m  {:>2}:{:02}   {:>3}:{:02}   {:>6}",
+            i + 1,
+            start_s / 60,
+            start_s % 60,
+            dip.max_depth_m,
+            dip.duration_s / 60,
+            dip.duration_s % 60,
+            dip.surface_s / 60,
+            dip.surface_s % 60,
+            temp,
+        )));
+        start_s += dip.duration_s;
+    }
+
+    let table = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Dips "));
+    frame.render_widget(table, area);
+}
+
 fn render_depth_chart(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let dive = match app.selected_dive() {
         Some(d) => d,
         None => return,
     };
+
+    if !dive.dips.is_empty() {
+        render_dips_table(frame, dive, area);
+        return;
+    }
 
     if dive.samples.is_empty() {
         let msg = Paragraph::new("  No sample data").block(

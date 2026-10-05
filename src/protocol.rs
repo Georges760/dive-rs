@@ -420,6 +420,14 @@ pub async fn read_dive_profile(conn: &mut BleConnection, dive_index: u16) -> Res
     ecop_read(conn, index, 3).await
 }
 
+/// Read the data of a freedive session for the given dive index.
+/// Returns FSTR and FEND records followed by one FHDR record per dip.
+/// Sub-index 3 holds nothing usable for these entries.
+pub async fn read_freedive_data(conn: &mut BleConnection, dive_index: u16) -> Result<Vec<u8>> {
+    let index = 0x3000 + dive_index;
+    ecop_read(conn, index, 5).await
+}
+
 /// Enumerate dive objects by trying to open them sequentially.
 /// Returns the number of valid dive objects found.
 pub async fn count_dives(conn: &mut BleConnection) -> Result<u16> {

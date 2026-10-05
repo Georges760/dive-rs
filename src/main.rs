@@ -524,7 +524,12 @@ async fn cmd_download(
             }
 
             eprint!("\rDownloading dive {}/{}...", i + 1, dive_count);
-            let profile = match protocol::read_dive_profile(&mut conn, i).await {
+            let profile = if parser::is_freedive_header(&header) {
+                protocol::read_freedive_data(&mut conn, i).await
+            } else {
+                protocol::read_dive_profile(&mut conn, i).await
+            };
+            let profile = match profile {
                 Ok(profile) => profile,
                 // The watch lists the dive but refuses to hand over its profile
                 Err(e) if e.is::<protocol::SdoAbort>() => {
@@ -543,12 +548,16 @@ async fn cmd_download(
             match parser::parse_dive_ecop(i as u32, &header, &profile) {
                 Ok(dive) => {
                     eprintln!(
-                        "\r  Dive #{}: {} | {:.1}m | {}s | {} samples",
+                        "\r  Dive #{}: {} | {:.1}m | {}s | {}",
                         dive.number,
                         dive.datetime.format("%Y-%m-%d %H:%M"),
                         dive.max_depth_m,
                         dive.duration_seconds,
-                        dive.samples.len(),
+                        if dive.dips.is_empty() {
+                            format!("{} samples", dive.samples.len())
+                        } else {
+                            format!("{} dips", dive.dips.len())
+                        },
                     );
                     new_dives.push(dive);
                 }
@@ -636,12 +645,16 @@ fn cmd_parse(raw_dir: PathBuf, output: PathBuf, format: OutputFormat) -> Result<
         match parser::parse_dive_ecop(i as u32, &header, &profile) {
             Ok(dive) => {
                 eprintln!(
-                    "  Dive #{}: {} | {:.1}m | {}min | {} samples | {:?}",
+                    "  Dive #{}: {} | {:.1}m | {}min | {} | {:?}",
                     dive.number,
                     dive.datetime.format("%Y-%m-%d %H:%M"),
                     dive.max_depth_m,
                     dive.duration_seconds / 60,
-                    dive.samples.len(),
+                    if dive.dips.is_empty() {
+                        format!("{} samples", dive.samples.len())
+                    } else {
+                        format!("{} dips", dive.dips.len())
+                    },
                     dive.dive_mode,
                 );
                 dives.push(dive);

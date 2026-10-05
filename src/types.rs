@@ -73,6 +73,17 @@ pub struct Sample {
     pub pressure_bar: Option<f64>,
 }
 
+/// One immersion of a freedive session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dip {
+    /// Time spent at the surface before this dip
+    pub surface_s: u32,
+    pub duration_s: u32,
+    pub max_depth_m: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_temp_c: Option<f64>,
+}
+
 /// A parsed dive log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiveLog {
@@ -84,6 +95,9 @@ pub struct DiveLog {
     pub dive_mode: DiveMode,
     pub gas_mixes: Vec<GasMix>,
     pub samples: Vec<Sample>,
+    /// Dips of a freedive session; the watch keeps no depth samples for them
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub dips: Vec<Dip>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub site: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]

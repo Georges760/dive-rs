@@ -69,6 +69,10 @@ pub fn dive_number_from_header(header: &[u8]) -> u32 {
 ///   0x3E: atmospheric pressure (u16 LE, 1/1000 bar)
 ///   0x54: gas mixes / tanks (5 entries, 20 bytes each)
 pub fn parse_dive_ecop(dive_index: u32, header: &[u8], profile: &[u8]) -> Result<DiveLog> {
+    if is_freedive_header(header) {
+        return parse_freedive_ecop(dive_index, header, profile);
+    }
+
     if header.len() < 0x60 {
         bail!("Dive header too short: {} bytes", header.len());
     }
@@ -134,10 +138,119 @@ pub fn parse_dive_ecop(dive_index: u32, header: &[u8], profile: &[u8]) -> Result
         dive_mode,
         gas_mixes,
         samples,
+        dips: Vec::new(),
         site: None,
         country: None,
         buddy: None,
     })
+}
+
+/// Header type (u16 LE at offset 0) of a freedive session; scuba dives use 1.
+const HEADER_TYPE_FREEDIVE: u16 = 4;
+
+/// Whether a raw header (sub-index 4) describes a freedive session.
+/// Its data must then be read from sub-index 5 instead of 3.
+pub fn is_freedive_header(header: &[u8]) -> bool {
+    header.len() >= 2 && read_u16_le(header, 0) == HEADER_TYPE_FREEDIVE
+}
+
+/// Parse a freedive session from ECOP protocol data (header + sub-index 5 data).
+///
+/// Session header layout (64 bytes, field names from the SSI app):
+///   0x00: type (u16 LE) - 4
+///   0x04: dive_number (u32 LE)
+///   0x08: datetime of the session start (u32 LE, packed bitfield)
+///   0x0C: settings (u32 LE), mode = 5
+///   0x14: session time (u16 LE, seconds)
+///   0x16: time under water (u16 LE, seconds)
+///   0x1C: number of dips (u16 LE)
+///   0x20: temperature_min (i16 LE, 1/10 C)
+///   0x24: maxdepth (u16 LE, 1/10 m)
+fn parse_freedive_ecop(dive_index: u32, header: &[u8], data: &[u8]) -> Result<DiveLog> {
+    if header.len() < 0x26 {
+        bail!("Freedive header too short: {} bytes", header.len());
+    }
+
+    let dive_number = read_u32_le(header, 0x04);
+    let datetime = decode_genius_datetime(read_u32_le(header, 0x08));
+    let duration_seconds = read_u16_le(header, 0x14) as u32;
+    let max_depth_m = read_u16_le(header, 0x24) as f64 / 10.0;
+
+    Ok(DiveLog {
+        number: if dive_number > 0 { dive_number } else { dive_index + 1 },
+        datetime,
+        duration_seconds,
+        max_depth_m,
+        dive_mode: DiveMode::Freedive,
+        gas_mixes: Vec::new(),
+        samples: Vec::new(),
+        dips: parse_freedive_dips(data),
+        site: None,
+        country: None,
+        buddy: None,
+    })
+}
+
+/// Freedive record sizes, tags and CRC included (firmware 01.10.00).
+const RECORD_FSTR: usize = 50;
+const RECORD_FEND: usize = 38;
+const RECORD_FHDR: usize = 22;
+
+/// Parse the FHDR records (one per dip) of a freedive session.
+///
+/// Data structure:
+///   [4 bytes] object classifier (type 0x20, minor, major)
+///   [FSTR 50 bytes] session start record
+///   [FEND 38 bytes] session end record
+///   [FHDR 22 bytes]* one per dip
+///
+/// FHDR payload (after the tag): dip number(2) + max depth(2, 1/10 m) +
+/// surface time(2, s) + dive time(2, s) + min temp(2, 1/10 C) + ?(2)
+fn parse_freedive_dips(data: &[u8]) -> Vec<Dip> {
+    let mut dips = Vec::new();
+
+    // Skip the 4-byte SObjectClassifier at the start
+    let mut offset = if data.len() >= 8 && &data[4..8] == b"FSTR" {
+        4
+    } else {
+        0
+    };
+
+    while offset + 4 <= data.len() {
+        match &data[offset..offset + 4] {
+            b"FSTR" => {
+                offset += RECORD_FSTR;
+            }
+            b"FEND" => {
+                offset += RECORD_FEND;
+            }
+            b"FHDR" => {
+                if offset + RECORD_FHDR > data.len() {
+                    break;
+                }
+
+                let temp_raw = read_u16_le(data, offset + 12) as i16;
+                dips.push(Dip {
+                    surface_s: read_u16_le(data, offset + 8) as u32,
+                    duration_s: read_u16_le(data, offset + 10) as u32,
+                    max_depth_m: read_u16_le(data, offset + 6) as f64 / 10.0,
+                    min_temp_c: if temp_raw > 0 {
+                        Some(temp_raw as f64 / 10.0)
+                    } else {
+                        None
+                    },
+                });
+
+                offset += RECORD_FHDR;
+            }
+            _ => {
+                // Unknown data, scan forward for next known tag
+                offset += 1;
+            }
+        }
+    }
+
+    dips
 }
 
 /// Known record sizes from libdivecomputer (mares_iconhd_parser.c).
