@@ -220,7 +220,7 @@ fn validate_response(data: &[u8]) -> Result<()> {
 //
 // BF payload format (18 bytes): [0x40, index_lo, index_hi, sub_index, 0x00 * 14]
 // BF response (17 bytes):       [status, index_lo, index_hi, sub_index, data[12], 0xEA]
-//   status 0x41 = segmented: bytes 4-5 = LE u16 data size, use AC/FE to read
+//   status 0x41 = segmented: bytes 4-7 = LE u32 data size, use AC/FE to read
 //   status 0x42 = expedited: bytes 4-15 = the 12 data bytes directly
 //   status 0x80 = abort / not found
 //
@@ -291,11 +291,11 @@ pub async fn ecop_read(
             Ok(ecop[4..16].to_vec())
         }
         SDO_SEGMENTED => {
-            // Bytes 4-5 = LE u16 data size
-            if ecop.len() < 6 {
+            // Bytes 4-7 = LE u32 data size
+            if ecop.len() < 8 {
                 bail!("Segmented response too short: {} bytes", ecop.len());
             }
-            let data_size = u16::from_le_bytes([ecop[4], ecop[5]]) as usize;
+            let data_size = u32::from_le_bytes([ecop[4], ecop[5], ecop[6], ecop[7]]) as usize;
 
             // Read data via alternating AC/FE segments
             let mut data = Vec::with_capacity(data_size);

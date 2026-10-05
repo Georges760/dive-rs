@@ -70,19 +70,15 @@ enum Commands {
 
     /// Read raw SDO objects and hex-dump them (protocol exploration)
     Sdo {
-        /// Object index, e.g. 0x3014 (dive index 20)
-        #[arg(value_parser = parse_u16)]
-        index: u16,
-
-        /// Sub-indexes to read, in order
-        #[arg(required = true)]
-        subs: Vec<u8>,
+        /// Objects to read in order, as INDEX:SUB[,SUB...], e.g. 0x3014:4,3 0x2008:1
+        #[arg(required = true, value_parser = parse_sdo_spec)]
+        objects: Vec<SdoSpec>,
 
         /// BLE device address. If omitted, connects to first Mares device found.
         #[arg(short, long)]
         address: Option<String>,
 
-        /// Save each object to <DIR>/<index>_<sub>.bin
+        /// Save each object to <DIR>/<index>_<sub>.bin and shorten the hex dump
         #[arg(long)]
         save: Option<PathBuf>,
     },
@@ -152,6 +148,25 @@ fn parse_u16(s: &str) -> Result<u16, std::num::ParseIntError> {
     }
 }
 
+/// One object index and the sub-indexes to read from it
+#[derive(Clone)]
+struct SdoSpec {
+    index: u16,
+    subs: Vec<u8>,
+}
+
+fn parse_sdo_spec(s: &str) -> Result<SdoSpec, String> {
+    let (index, subs) = s
+        .split_once(':')
+        .ok_or("expected INDEX:SUB[,SUB...]")?;
+    let index = parse_u16(index).map_err(|e| e.to_string())?;
+    let subs = subs
+        .split(',')
+        .map(|sub| sub.parse().map_err(|e| format!("sub-index {sub:?}: {e}")))
+        .collect::<Result<_, _>>()?;
+    Ok(SdoSpec { index, subs })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -167,11 +182,10 @@ async fn main() -> Result<()> {
         } => cmd_download(address, output, format, save_raw).await,
         Commands::Debug { address } => cmd_debug(address).await,
         Commands::Sdo {
-            index,
-            subs,
+            objects,
             address,
             save,
-        } => cmd_sdo(address, index, subs, save).await,
+        } => cmd_sdo(address, objects, save).await,
         Commands::View { input } => tui::run(input),
         Commands::Correlate { csv, json } => cmd_correlate(csv, json),
         Commands::Watermark {
@@ -237,8 +251,7 @@ async fn cmd_scan(timeout_secs: u64, enumerate: bool) -> Result<()> {
 
 async fn cmd_sdo(
     address: Option<String>,
-    index: u16,
-    subs: Vec<u8>,
+    objects: Vec<SdoSpec>,
     save: Option<PathBuf>,
 ) -> Result<()> {
     let adapter = ble::get_adapter().await?;
@@ -246,22 +259,29 @@ async fn cmd_sdo(
     let mut conn = ble::connect(&peripheral, None, None).await?;
     protocol::get_device_info(&mut conn).await?;
 
-    for sub in subs {
-        match protocol::ecop_read(&mut conn, index, sub).await {
-            Ok(data) => {
-                println!("0x{index:04X} sub {sub}: {} bytes", data.len());
-                for (i, row) in data.chunks(16).enumerate() {
-                    println!("  {:04X}  {}", i * 16, protocol::hex_dump(row));
+    // With --save the file has the full data, so only show the start
+    let max_rows = if save.is_some() { 4 } else { usize::MAX };
+
+    for SdoSpec { index, subs } in objects {
+        for sub in subs {
+            // Keep going on errors: one refused object should not cost the session
+            let data = match protocol::ecop_read(&mut conn, index, sub).await {
+                Ok(data) => data,
+                Err(e) => {
+                    println!("0x{index:04X} sub {sub}: {e:#}");
+                    continue;
                 }
-                if let Some(ref dir) = save {
-                    std::fs::create_dir_all(dir)?;
-                    std::fs::write(dir.join(format!("{index:04X}_{sub}.bin")), &data)?;
-                }
+            };
+            println!("0x{index:04X} sub {sub}: {} bytes", data.len());
+            for (i, row) in data.chunks(16).enumerate().take(max_rows) {
+                println!("  {:04X}  {}", i * 16, protocol::hex_dump(row));
             }
-            Err(e) if e.is::<protocol::SdoAbort>() => println!("{e}"),
-            Err(e) => {
-                conn.disconnect().await.ok();
-                return Err(e);
+            if data.len() > max_rows.saturating_mul(16) {
+                println!("  ...");
+            }
+            if let Some(ref dir) = save {
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(dir.join(format!("{index:04X}_{sub}.bin")), &data)?;
             }
         }
     }
