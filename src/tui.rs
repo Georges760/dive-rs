@@ -7,11 +7,11 @@ use blit_tui::atom::{Border, TitlePosition};
 use blit_tui::cell::{Cell, CellStyle};
 use blit_tui::color::Color;
 use blit_tui::layout::{flex, Justify};
-use blit_tui::text::{Span, TextAttributes};
+use blit_tui::text::{Span, TextAttributes, TextOptions, TextOverflow, TextWrap};
 use blit_tui::widget::{scroll_list, Block, Text, Title};
 use blit_tui::{TuiContext, Ui};
 
-use crate::types::{DiveData, DiveLog, DiveMode};
+use crate::types::{DiveData, DiveLog, DiveMode, SafetyStop, Sample, Water};
 
 struct App {
     dives: Vec<DiveLog>,
@@ -148,7 +148,7 @@ impl App {
         let mut column = ui.layout(flex::column());
         column
             .child()
-            .item(flex::item().width(Sizing::grow()).height(Sizing::fixed(8.0)))
+            .item(flex::item().width(Sizing::grow()).height(Sizing::fit()))
             .build(|ui: Ui<'_>| render_dive_info(ui, dive));
         column
             .child()
@@ -280,7 +280,14 @@ impl App {
         let readout: Vec<(String, Color)> = match picked {
             Some(sample) => vec![
                 (
-                    format!("{:02}:{:02}  ", sample.time_s / 60, sample.time_s % 60),
+                    // Time into the dive, then the time of day
+                    format!(
+                        "{:02}:{:02} ({})  ",
+                        sample.time_s / 60,
+                        sample.time_s % 60,
+                        (dive.datetime + chrono::Duration::seconds(sample.time_s as i64))
+                            .format("%H:%M:%S"),
+                    ),
                     Color::YELLOW,
                 ),
                 (format!("{:.1} m  ", sample.depth_m), Color::CYAN),
@@ -299,17 +306,54 @@ impl App {
             ],
             None => vec![("click the chart to read values ".to_string(), Color::DARK_GRAY)],
         };
-        let readout_spans: Vec<Span<'_>> = readout
-            .iter()
-            .map(|(text, color)| Span::new(text).color(*color))
+        // Two spaces first, to stay clear of the legend
+        let readout_spans: Vec<Span<'_>> = std::iter::once(Span::new("  "))
+            .chain(
+                readout
+                    .iter()
+                    .map(|(text, color)| Span::new(text).color(*color)),
+            )
             .collect();
+        let one_line = TextOptions::new()
+            .max_lines(1)
+            .overflow(TextOverflow::Ellipsis);
 
         {
             let mut top = panel
                 .child()
                 .layout(flex::row().justify(Justify::SpaceBetween));
-            top.child().insert(Text::rich(&spans));
+            // The legend gives way when the two do not fit: the readout is
+            // what the click asked for
+            top.child()
+                .item(
+                    flex::item()
+                        .width(Sizing::grow())
+                        .height(Sizing::fixed(1.0)),
+                )
+                .insert(Text::rich(&spans).options(one_line));
             top.child().insert(Text::rich(&readout_spans));
+        }
+
+        // Two more rows for what the newer logs hold at each sample. Kept
+        // even with no sample picked, so that the chart does not move.
+        if dive.samples[0].speed_m_min.is_some() {
+            let [state, signals, alarms] = picked.map(sample_readout).unwrap_or_default();
+            let row = || {
+                flex::item()
+                    .width(Sizing::grow())
+                    .height(Sizing::fixed(1.0))
+            };
+            panel
+                .child()
+                .item(row())
+                .insert(Text::new(&state).options(one_line));
+            panel.child().item(row()).insert(
+                Text::rich(&[
+                    Span::new(&signals),
+                    Span::new(&alarms).color(Color::MAGENTA),
+                ])
+                .options(one_line),
+            );
         }
 
         panel
@@ -371,28 +415,68 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog) {
     let gas_str = dive
         .gas_mixes
         .iter()
-        .map(|g| format!("{}% O2", g.o2))
+        .map(|g| match g.he {
+            0 => format!("{}% O2", g.o2),
+            he => format!("{}% O2 {he}% He", g.o2),
+        })
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Temperature range from samples, or from the dips of a freedive session
-    let (temp_min, temp_max) = dive
-        .samples
-        .iter()
-        .filter_map(|s| s.temp_c)
-        .chain(dive.dips.iter().filter_map(|d| d.min_temp_c))
-        .fold((f64::MAX, f64::MIN), |(min, max), t| {
-            (min.min(t), max.max(t))
-        });
+    // Temperature range from the header, else from the samples, or from the
+    // dips of a freedive session
+    let (temp_min, temp_max) = match (dive.min_temp_c, dive.max_temp_c) {
+        (Some(min), Some(max)) => (min, max),
+        _ => dive
+            .samples
+            .iter()
+            .filter_map(|s| s.temp_c)
+            .chain(dive.dips.iter().filter_map(|d| d.min_temp_c))
+            .fold((f64::MAX, f64::MIN), |(min, max), t| {
+                (min.min(t), max.max(t))
+            }),
+    };
 
-    // Pressure: first and last non-None values
-    let pressure_start = dive.samples.iter().find_map(|s| s.pressure_bar);
-    let pressure_end = dive.samples.iter().rev().find_map(|s| s.pressure_bar);
+    // Pressure: per tank from the header, else the first and last samples
+    let tanks: Vec<_> = dive
+        .gas_mixes
+        .iter()
+        .filter_map(|g| g.tank.as_ref())
+        .collect();
+    let pressure = if tanks.is_empty() {
+        let start = dive.samples.iter().find_map(|s| s.pressure_bar);
+        let end = dive.samples.iter().rev().find_map(|s| s.pressure_bar);
+        start
+            .zip(end)
+            .map(|(start, end)| format!("{start:.0} -> {end:.0} bar"))
+    } else {
+        Some(
+            tanks
+                .iter()
+                .map(|tank| format!("{:.0} -> {:.0} bar", tank.start_bar, tank.end_bar))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    };
+    let tank_sizes = tanks
+        .iter()
+        .filter_map(|tank| tank.volume_l.zip(tank.working_bar))
+        .map(|(volume, working)| format!("{volume} l, {working} bar"))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let mut date = format!(" Date:      {}", dive.datetime.format("%Y-%m-%d %H:%M"));
+    if let Some(end) = dive.end_datetime {
+        date.push_str(&format!(" - {}", end.format("%H:%M")));
+    }
+    let mut depth = format!(" Max depth: {:.1} m", dive.max_depth_m);
+    if let Some(avg) = dive.avg_depth_m {
+        depth.push_str(&format!(" (avg {avg:.1} m)"));
+    }
 
     let mut left_col: Vec<String> = vec![
-        format!(" Date:      {}", dive.datetime.format("%Y-%m-%d %H:%M")),
+        date,
         format!(" Duration:  {:02}:{:02}", duration_min, duration_sec),
-        format!(" Max depth: {:.1} m", dive.max_depth_m),
+        depth,
     ];
 
     let mut right_col: Vec<String> = vec![if dive.dips.is_empty() {
@@ -405,8 +489,8 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog) {
         right_col.push(format!(" Temp:      {:.1} - {:.1} C", temp_min, temp_max));
     }
 
-    if let (Some(start), Some(end)) = (pressure_start, pressure_end) {
-        right_col.push(format!(" Pressure:  {:.0} -> {:.0} bar", start, end));
+    if let Some(pressure) = pressure {
+        right_col.push(format!(" Pressure:  {pressure}"));
     }
 
     if let Some(ref site) = dive.site {
@@ -417,6 +501,49 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog) {
     }
     if let Some(ref buddy) = dive.buddy {
         left_col.push(format!(" Buddy/Ctr: {}", buddy));
+    }
+
+    // 0 when the watch counts the dive as the first
+    if let Some(interval) = dive.surface_interval_s.filter(|&s| s > 0) {
+        left_col.push(format!(
+            " Surface:   {}:{:02} h since last dive",
+            interval / 3600,
+            interval % 3600 / 60
+        ));
+    }
+    let water = dive.water.map(|water| match water {
+        Water::Fresh => "fresh".to_string(),
+        Water::Salt => "salt".to_string(),
+        Water::En13319 => "EN 13319".to_string(),
+    });
+    let atmospheric = dive.atmospheric_mbar.map(|mbar| format!("{mbar} mbar"));
+    if water.is_some() || atmospheric.is_some() {
+        let parts: Vec<String> = water.into_iter().chain(atmospheric).collect();
+        left_col.push(format!(" Water:     {}", parts.join(", ")));
+    }
+    if let (Some(start), Some(end)) = (dive.battery_start_pct, dive.battery_end_pct) {
+        left_col.push(format!(" Battery:   {start} -> {end} %"));
+    }
+
+    if !tank_sizes.is_empty() {
+        right_col.push(format!(" Tank:      {tank_sizes}"));
+    }
+    if !dive.gradient_factors.is_empty() {
+        let sets: Vec<String> = dive
+            .gradient_factors
+            .iter()
+            .map(|gf| format!("{}/{}", gf.low, gf.high))
+            .collect();
+        right_col.push(format!(" GF:        {}", sets.join(", ")));
+    }
+    if let (Some(start), Some(end)) = (dive.cns_start_pct, dive.cns_end_pct) {
+        right_col.push(format!(" CNS:       {start:.1} -> {end:.1} %"));
+    }
+    if let (Some(start), Some(end)) = (dive.otu_start, dive.otu_end) {
+        right_col.push(format!(" OTU:       {start:.1} -> {end:.1}"));
+    }
+    if let Some(speed) = dive.max_ascent_speed_m_min {
+        right_col.push(format!(" Ascent:    {speed:.1} m/min max"));
     }
 
     let mut panel = ui.layout(flex::column().padding(Sides::all(1.0)));
@@ -439,16 +566,134 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog) {
     ]));
 
     // Two columns of fields, each taking half of the width
-    let mut columns = panel.child().item(flex::item().grow()).layout(flex::row());
-    for lines in [&left_col, &right_col] {
-        let mut column = columns
-            .child()
-            .item(flex::item().grow())
-            .layout(flex::column());
-        for line in lines {
-            column.child().insert(Text::new(line));
+    let fit = || flex::item().width(Sizing::grow()).height(Sizing::fit());
+    {
+        let mut columns = panel.child().item(fit()).layout(flex::row());
+        for lines in [&left_col, &right_col] {
+            let mut column = columns.child().item(fit()).layout(flex::column());
+            for line in lines {
+                column.child().insert(Text::new(line));
+            }
         }
     }
+
+    // The alarms take the full width, and as many lines as they need
+    if !dive.alarms.is_empty() {
+        let alarms = dive.alarms.join(", ").replace('_', " ");
+        let mut row = panel.child().item(fit()).layout(flex::row());
+        row.child().insert(Text::new(" Alarms:    "));
+        row.child().item(fit()).insert(
+            Text::new(&alarms)
+                .color(Color::MAGENTA)
+                .options(TextOptions::new().wrap(TextWrap::Word)),
+        );
+    }
+
+    let tissues = [("N2", &dive.tissue_n2_mbar), ("He", &dive.tissue_he_mbar)];
+    for (i, (gas, pressures)) in tissues.into_iter().enumerate() {
+        if pressures.is_empty() {
+            continue;
+        }
+        let (min, max) = pressures
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(min, max), &p| {
+                (min.min(p), max.max(p))
+            });
+        let range = if max > min {
+            format!("{min:.0}-{max:.0}")
+        } else {
+            format!("{min:.0}")
+        };
+        panel.child().insert(Text::new(&format!(
+            " {:<11}{}  {gas} {range} mbar at the start",
+            if i == 0 { "Tissues:" } else { "" },
+            tissue_bars(pressures),
+        )));
+    }
+}
+
+/// One bar per tissue compartment, from the least to the most loaded.
+fn tissue_bars(pressures: &[f64]) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let (min, max) = pressures
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(min, max), &p| {
+            (min.min(p), max.max(p))
+        });
+    pressures
+        .iter()
+        .map(|&p| {
+            let level = if max > min {
+                (p - min) / (max - min)
+            } else {
+                0.0
+            };
+            BARS[(level * 7.0).round() as usize]
+        })
+        .collect()
+}
+
+/// What the newer logs hold at a sample, as three pieces of text: where the
+/// dive stands, what the watch works out, and the alarms it raises.
+fn sample_readout(sample: &Sample) -> [String; 3] {
+    let mut state = Vec::new();
+    if let Some(speed) = sample.speed_m_min {
+        let arrow = match speed {
+            s if s > 0.0 => '↑',
+            s if s < 0.0 => '↓',
+            _ => '→',
+        };
+        state.push(format!("{arrow} {:.1} m/min", speed.abs()));
+    }
+    if let Some(ndl) = sample.ndl_min {
+        state.push(format!("NDL {ndl} min"));
+    }
+    if let Some(time) = sample.deco_time_min {
+        state.push(match sample.deco_stop_m {
+            Some(stop) => format!("deco {time} min at {stop} m"),
+            None => format!("deco {time} min"),
+        });
+    }
+    if let (Some(now), Some(surface)) = (sample.gf_pct, sample.surface_gf_pct) {
+        state.push(format!("GF {now:.0} %, surface {surface:.0} %"));
+    }
+    if let Some(ambient) = sample.ambient_mbar {
+        state.push(format!("{ambient} mbar"));
+    }
+
+    let mut signals = Vec::new();
+    if let Some(minutes) = sample.gas_time_min {
+        signals.push(format!("gas for {minutes} min"));
+    }
+    if let Some(sac) = sample.sac_l_min {
+        signals.push(format!("{sac} l/min"));
+    }
+    if let Some(stop) = sample.safety_stop {
+        signals.push(format!(
+            "safety stop {}",
+            match stop {
+                SafetyStop::Due => "due",
+                SafetyStop::Running => "running",
+                SafetyStop::Paused => "paused",
+            }
+        ));
+    }
+    if sample.gas > 0 {
+        signals.push(format!("mix {}", sample.gas + 1));
+    }
+    if sample.gf_set > 0 {
+        signals.push(format!("GF set {}", sample.gf_set + 1));
+    }
+    if sample.bookmark > 0 {
+        signals.push(format!("bookmark {}", sample.bookmark));
+    }
+
+    let mut signals = format!(" {}", signals.join("  "));
+    let alarms = sample.alarms.join(", ").replace('_', " ");
+    if !alarms.is_empty() && signals.len() > 1 {
+        signals.push_str("  ");
+    }
+    [format!(" {}", state.join("  ")), signals, alarms]
 }
 
 /// Freedive sessions have no depth samples: list the dips instead of a chart.
@@ -603,5 +848,195 @@ impl Atom<TuiContext> for LineChart {
 
     fn paint_bounds(&self, area: LogicalRect) -> LogicalRect {
         area
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use blit::{Frame, FrameInfo, LayoutResolution, LogicalSize};
+    use blit_tui::{RendererConfig, TuiRenderer};
+
+    use super::*;
+    use crate::types::{GasMix, GradientFactors, Tank};
+
+    /// Render the viewer off-screen and return what the terminal would show.
+    fn screen(app: &mut App, columns: u16, rows: u16) -> String {
+        let renderer = TuiRenderer::new(RendererConfig::new().columns(columns).rows(rows));
+        let mut context = TuiContext::new(renderer);
+        let mut frame: Frame<TuiContext> = Frame::default();
+        let info = FrameInfo::new(LogicalSize::new(columns as f32, rows as f32)).layout_resolution(
+            LayoutResolution::Discrete {
+                step: LogicalSize::uniform(1.0),
+            },
+        );
+        // Twice: the list and the chart place themselves from the frame before
+        for pass in 0..2 {
+            let now = Duration::from_millis(pass * 10);
+            frame.build(&mut context, info, now, Input::None, |ui: Ui<'_>| {
+                app.render(ui)
+            });
+            frame.layout(&mut context);
+        }
+        context.begin_paint();
+        frame.paint(&mut context);
+        context.finish_paint();
+        context.renderer().plain_text()
+    }
+
+    fn sample(time_s: u32, depth_m: f64) -> Sample {
+        Sample {
+            time_s,
+            depth_m,
+            temp_c: Some(25.4),
+            ..Default::default()
+        }
+    }
+
+    /// A dive as an older log holds it: depth, temperature, tank pressure.
+    fn plain_dive() -> DiveLog {
+        DiveLog {
+            number: 44,
+            datetime: chrono::NaiveDate::from_ymd_opt(2025, 8, 1)
+                .unwrap()
+                .and_hms_opt(16, 3, 0)
+                .unwrap(),
+            duration_seconds: 2990,
+            max_depth_m: 31.2,
+            gas_mixes: vec![GasMix {
+                o2: 21,
+                ..Default::default()
+            }],
+            samples: vec![sample(0, 2.0), sample(5, 25.6), sample(10, 32.9)],
+            site: Some("Blue Hole".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The same dive with what the watch logs besides.
+    fn full_dive() -> DiveLog {
+        let mut dive = plain_dive();
+        dive.end_datetime = Some(dive.datetime + chrono::Duration::minutes(52));
+        dive.avg_depth_m = Some(16.2);
+        dive.min_temp_c = Some(20.4);
+        dive.max_temp_c = Some(26.1);
+        dive.water = Some(Water::Salt);
+        dive.atmospheric_mbar = Some(1048);
+        dive.surface_interval_s = Some(16180);
+        dive.cns_start_pct = Some(0.21);
+        dive.cns_end_pct = Some(5.65);
+        dive.otu_start = Some(0.54);
+        dive.otu_end = Some(14.62);
+        dive.gradient_factors = vec![
+            GradientFactors { low: 85, high: 85 },
+            GradientFactors { low: 95, high: 95 },
+        ];
+        dive.max_ascent_speed_m_min = Some(14.9);
+        dive.battery_start_pct = Some(58);
+        dive.battery_end_pct = Some(53);
+        dive.alarms = vec!["slow_down".to_string(), "tank_lost_link".to_string()];
+        dive.tissue_n2_mbar = (0..16).map(|i| 755.0 + 15.0 * i as f64).collect();
+        dive.gas_mixes[0].tank = Some(Tank {
+            start_bar: 209.1,
+            end_bar: 99.0,
+            volume_l: Some(12),
+            working_bar: Some(200),
+        });
+
+        let bottom = &mut dive.samples[1];
+        bottom.pressure_bar = Some(190.0);
+        bottom.ambient_mbar = Some(3629);
+        bottom.speed_m_min = Some(-3.2);
+        bottom.ndl_min = Some(17);
+        bottom.gf_pct = Some(-42.1);
+        bottom.surface_gf_pct = Some(23.6);
+        bottom.safety_stop = Some(SafetyStop::Due);
+        bottom.gas_time_min = Some(28);
+        bottom.sac_l_min = Some(18);
+
+        let deco = &mut dive.samples[2];
+        deco.speed_m_min = Some(7.3);
+        deco.deco_time_min = Some(1);
+        deco.deco_stop_m = Some(3);
+        deco.gf_pct = Some(-25.9);
+        deco.surface_gf_pct = Some(89.8);
+        deco.alarms = vec!["slow_down".to_string(), "nodeco_deco".to_string()];
+
+        dive.samples[0].speed_m_min = Some(0.0);
+        dive
+    }
+
+    /// Row of the screen on which `text` shows.
+    fn row_of(screen: &str, text: &str) -> usize {
+        let row = screen.lines().position(|line| line.contains(text));
+        row.unwrap_or_else(|| panic!("{text:?} is not on the screen:\n{screen}"))
+    }
+
+    #[test]
+    fn details_show_what_the_watch_logs_about_the_dive() {
+        let mut app = App::new(vec![full_dive()]);
+        let screen = screen(&mut app, 120, 36);
+
+        for text in [
+            "Date:      2025-08-01 16:03 - 16:55",
+            "Max depth: 31.2 m (avg 16.2 m)",
+            "Surface:   4:29 h since last dive",
+            "Water:     salt, 1048 mbar",
+            "Battery:   58 -> 53 %",
+            "Temp:      20.4 - 26.1 C",
+            "Pressure:  209 -> 99 bar",
+            "Tank:      12 l, 200 bar",
+            "GF:        85/85, 95/95",
+            "CNS:       0.2 -> 5.7 %",
+            "OTU:       0.5 -> 14.6",
+            "Ascent:    14.9 m/min max",
+            "Alarms:    slow down, tank lost link",
+            "Tissues:   ▁▁▂▂▃▃▄▄▅▅▆▆▇▇██  N2 755-980 mbar at the start",
+        ] {
+            row_of(&screen, text);
+        }
+    }
+
+    #[test]
+    fn readout_shows_what_the_watch_logs_at_the_picked_sample() {
+        let mut app = App::new(vec![full_dive()]);
+
+        app.cursor.set(Some((0, 1)));
+        let bottom = screen(&mut app, 120, 36);
+        let legend = row_of(&bottom, "00:05 (16:03:05)  25.6 m  190 bar  25.4 C");
+        assert_eq!(
+            row_of(
+                &bottom,
+                "↓ 3.2 m/min  NDL 17 min  GF -42 %, surface 24 %  3629 mbar"
+            ),
+            legend + 1
+        );
+        assert_eq!(
+            row_of(&bottom, "gas for 28 min  18 l/min  safety stop due"),
+            legend + 2
+        );
+
+        app.cursor.set(Some((0, 2)));
+        let deco = screen(&mut app, 120, 36);
+        row_of(
+            &deco,
+            "↑ 7.3 m/min  deco 1 min at 3 m  GF -26 %, surface 90 %",
+        );
+        row_of(&deco, " slow down, nodeco deco");
+    }
+
+    #[test]
+    fn dive_from_an_older_log_keeps_its_short_panel() {
+        let mut app = App::new(vec![plain_dive()]);
+        app.cursor.set(Some((0, 1)));
+        let screen = screen(&mut app, 120, 36);
+
+        // Title, three rows of fields, borders: the chart panel comes next
+        assert_eq!(row_of(&screen, "Site:      Blue Hole"), 5);
+        assert_eq!(row_of(&screen, "Depth Profile"), 7);
+        // and the chart right under the legend, with no readout rows between
+        let legend = row_of(&screen, "00:05 (16:03:05)  25.6 m  - bar  25.4 C");
+        assert!(screen.lines().nth(legend + 1).unwrap().contains(" 0m│"));
     }
 }
