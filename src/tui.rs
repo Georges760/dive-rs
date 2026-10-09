@@ -211,8 +211,9 @@ impl App {
                     }
                     // An ignored dive is not counted
                     let number = numbers[dive_index].map_or(String::new(), |n| format!("#{n}"));
-                    let line = format!(
-                        " {number:<4} {} {:5.1}m {:3}min {}",
+                    let number = format!(" {number:<4} ");
+                    let rest = format!(
+                        "{} {:5.1}m {:3}min {}",
                         dive.datetime.format("%Y-%m-%d"),
                         dive.max_depth_m,
                         dive.duration_seconds / 60,
@@ -221,14 +222,18 @@ impl App {
                     if index == selected {
                         ui.insert(Block::new().background(Color::CYAN));
                         ui.insert(
-                            Text::new(&line)
+                            Text::new(&format!("{number}{rest}"))
                                 .color(Color::BLACK)
                                 .attributes(TextAttributes::BOLD),
                         );
                     } else if dive.ignored {
-                        ui.insert(Text::new(&line).color(Color::DARK_GRAY));
+                        ui.insert(Text::new(&format!("{number}{rest}")).color(Color::DARK_GRAY));
                     } else {
-                        ui.insert(Text::new(&line));
+                        // The colour of the number alone tells the kind of dive
+                        ui.insert(Text::rich(&[
+                            Span::new(&number).color(number_color(&dive.dive_mode)),
+                            Span::new(&rest),
+                        ]));
                     }
                 },
                 |active| {
@@ -508,6 +513,15 @@ pub fn run(input: PathBuf) -> Result<()> {
     blit_tui::run(|ui| app.render(ui)).context("Terminal UI failed")?;
 
     Ok(())
+}
+
+/// Colour of the number of a dive in the list: one for the freedive
+/// sessions, one for all the other dives.
+fn number_color(mode: &DiveMode) -> Color {
+    match mode {
+        DiveMode::Freedive => Color::CYAN,
+        _ => Color::YELLOW,
+    }
 }
 
 fn mode_short(mode: &DiveMode) -> &'static str {
@@ -993,6 +1007,11 @@ mod tests {
 
     /// Render the viewer off-screen and return what the terminal would show.
     fn screen(app: &mut App, columns: u16, rows: u16) -> String {
+        render(app, columns, rows).renderer().plain_text()
+    }
+
+    /// Render the viewer off-screen.
+    fn render(app: &mut App, columns: u16, rows: u16) -> TuiContext {
         let renderer = TuiRenderer::new(RendererConfig::new().columns(columns).rows(rows));
         let mut context = TuiContext::new(renderer);
         let mut frame: Frame<TuiContext> = Frame::default();
@@ -1012,7 +1031,7 @@ mod tests {
         context.begin_paint();
         frame.paint(&mut context);
         context.finish_paint();
-        context.renderer().plain_text()
+        context
     }
 
     fn sample(time_s: u32, depth_m: f64) -> Sample {
@@ -1298,5 +1317,23 @@ mod tests {
         row_of(&text, "Site:      Ras il-Hobz");
         row_of(&text, "No sample data");
         assert!(!text.contains("Gas:"));
+    }
+
+    #[test]
+    fn number_in_the_list_has_the_colour_of_the_kind_of_dive() {
+        let mut dives = three_dives();
+        dives[1].dive_mode = DiveMode::Freedive;
+        let mut app = App::new(PathBuf::new(), dives);
+
+        // What goes to the terminal, escape sequences included
+        let context = render(&mut app, 120, 36);
+        let output = String::from_utf8_lossy(context.renderer().output());
+
+        // Cyan for the freedive session, yellow for a scuba dive, and the
+        // default colour back for the rest of the row
+        assert!(output.contains("\x1b[36m #1   \x1b[39m2025-08-01  31.2m  49min Fr"));
+        assert!(output.contains("\x1b[33m #1   \x1b[39m2025-08-01  31.2m  49min Ai"));
+        // The selected row keeps its own colours, number included
+        assert!(output.contains("\x1b[0;1;30;46m #2   2025-08-01"));
     }
 }

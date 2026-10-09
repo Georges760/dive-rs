@@ -81,7 +81,7 @@ sirius-dive view
 
 Navigate with `j`/`k` or arrow keys. Toggle overlays with `d` (depth), `t` (temperature), `p` (pressure). Quit with `q`.
 
-Dives are listed by date and numbered as the SSI logbook numbers them: in that order, scuba dives and freedive sessions each on their own, ignored dives not counted. The number a dive has on the watch shows next to its title. `fit` names dives by the same logbook number.
+Dives are listed by date and numbered as the SSI logbook numbers them: in that order, scuba dives and freedive sessions each on their own, ignored dives not counted. The number a dive has on the watch shows next to its title. `fit` names dives by the same logbook number. In the list the number is yellow, or cyan for a freedive session.
 
 Press `i` to ignore the selected dive, an accidental one for instance. It leaves the list but stays in `dives.json`, marked as ignored, so the next download does not bring it back. `a` lists the ignored dives again, and `i` on one of them takes it back. The `fit` and `correlate` commands leave ignored dives out.
 
