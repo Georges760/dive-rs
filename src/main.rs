@@ -146,8 +146,9 @@ enum Commands {
         number: Option<u32>,
 
         /// Time zone the dive computer's clock was set to, as an offset from
-        /// UTC such as "+02:00". Defaults to this machine's time zone on the
-        /// day of the dive. FIT timestamps are in UTC.
+        /// UTC such as "+02:00". Defaults to the time zone of the country of
+        /// the dive on that day, or of this machine for a dive with no
+        /// country. FIT timestamps are in UTC.
         #[arg(long, allow_hyphen_values = true)]
         utc_offset: Option<chrono::FixedOffset>,
 
@@ -1430,15 +1431,45 @@ fn cmd_watermark(
 
 // ── FIT export ──
 
-/// UTC offset of this machine's time zone at a local time.
-fn local_utc_offset(datetime: chrono::NaiveDateTime) -> chrono::FixedOffset {
-    use chrono::TimeZone;
+/// UTC offset of a time zone at a local time.
+fn utc_offset_at<Z: chrono::TimeZone>(
+    zone: &Z,
+    datetime: chrono::NaiveDateTime,
+) -> chrono::FixedOffset {
+    use chrono::Offset;
 
-    chrono::Local
-        .offset_from_local_datetime(&datetime)
+    zone.offset_from_local_datetime(&datetime)
         .earliest()
         // A time skipped by a clock change has no offset of its own
-        .unwrap_or_else(|| chrono::Local.offset_from_utc_datetime(&datetime))
+        .unwrap_or_else(|| zone.offset_from_utc_datetime(&datetime))
+        .fix()
+}
+
+/// Time zone of a country, under the name the SSI logbook or English gives
+/// it. Only the countries of the logbook so far, each with the one time
+/// zone of its mainland.
+fn country_time_zone(country: &str) -> Option<chrono_tz::Tz> {
+    use chrono_tz::Tz;
+
+    // Whatever the case and the accents: "Égypte" is "Egypte"
+    let name: String = country
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'é' | 'è' | 'ê' => 'e',
+            other => other,
+        })
+        .collect();
+    match name.as_str() {
+        "france" => Some(Tz::Europe__Paris),
+        "malte" | "malta" => Some(Tz::Europe__Malta),
+        "egypte" | "egypt" => Some(Tz::Africa__Cairo),
+        "croatie" | "croatia" => Some(Tz::Europe__Zagreb),
+        "espagne" | "spain" => Some(Tz::Europe__Madrid),
+        "inde" | "india" => Some(Tz::Asia__Kolkata),
+        _ => None,
+    }
 }
 
 fn cmd_fit(
@@ -1481,7 +1512,20 @@ fn cmd_fit(
     std::fs::create_dir_all(&output)?;
     let mut exported = 0;
     for (dive, number) in dives {
-        let zone = utc_offset.unwrap_or_else(|| local_utc_offset(dive.datetime));
+        // Unless told otherwise, the clock of the dive computer is taken to
+        // be on the time of the country of the dive, and failing that on the
+        // time of this machine
+        let country_zone = dive.country.as_deref().and_then(country_time_zone);
+        let zone = match (utc_offset, country_zone) {
+            (Some(zone), _) => zone,
+            (None, Some(country)) => utc_offset_at(&country, dive.datetime),
+            (None, None) => utc_offset_at(&chrono::Local, dive.datetime),
+        };
+        let zone_from = match (utc_offset, &dive.country, country_zone) {
+            (Some(_), ..) | (None, None, _) => String::new(),
+            (None, Some(country), Some(_)) => format!(" ({country})"),
+            (None, Some(country), None) => format!(" (no time zone known for {country})"),
+        };
         let start = dive.datetime - zone + chrono::Duration::seconds(offset);
 
         let file = match fit::encode_dive(dive, number, start, zone.local_minus_utc(), interval) {
@@ -1499,7 +1543,7 @@ fn cmd_fit(
         std::fs::write(&path, file)
             .with_context(|| format!("Failed to write {}", path.display()))?;
         eprintln!(
-            "  Dive #{number}: {} UTC{zone} -> {}",
+            "  Dive #{number}: {} UTC{zone}{zone_from} -> {}",
             dive.datetime.format("%Y-%m-%d %H:%M"),
             path.display()
         );
@@ -1736,6 +1780,30 @@ mod tests {
             ["Richard Puntous", "LAGUNE PLONGEE"]
         );
         assert!(buddy_blocks("  \t Mares Sirius").is_empty());
+    }
+
+    #[test]
+    fn utc_offset_comes_from_the_country_of_the_dive() {
+        let hours = |country: &str, (year, month, day): (i32, u32, u32)| {
+            let datetime = chrono::NaiveDate::from_ymd_opt(year, month, day)
+                .unwrap()
+                .and_hms_opt(10, 0, 0)
+                .unwrap();
+            let zone = country_time_zone(country).unwrap();
+            utc_offset_at(&zone, datetime).local_minus_utc() as f64 / 3600.0
+        };
+
+        // Egypt has had summer time again since 2023
+        assert_eq!(hours("Egypte", (2022, 7, 1)), 2.0);
+        assert_eq!(hours("Egypte", (2023, 5, 8)), 3.0);
+        assert_eq!(hours("Égypte", (2026, 1, 15)), 2.0);
+        assert_eq!(hours("France", (2026, 7, 25)), 2.0);
+        assert_eq!(hours("France", (2026, 1, 25)), 1.0);
+        assert_eq!(hours("Malte", (2026, 10, 4)), 2.0);
+        assert_eq!(hours("Croatia", (2025, 10, 26)), 1.0);
+        assert_eq!(hours("Inde", (2023, 2, 24)), 5.5);
+
+        assert!(country_time_zone("Atlantide").is_none());
     }
 
     #[test]
