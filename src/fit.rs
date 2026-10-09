@@ -17,6 +17,7 @@ const MESG_RECORD: u16 = 20;
 const MESG_EVENT: u16 = 21;
 const MESG_DEVICE_INFO: u16 = 23;
 const MESG_ACTIVITY: u16 = 34;
+const MESG_DIVE_SETTINGS: u16 = 258;
 const MESG_DIVE_GAS: u16 = 259;
 const MESG_DIVE_SUMMARY: u16 = 268;
 const MESG_TANK_UPDATE: u16 = 319;
@@ -47,6 +48,7 @@ enum Value {
     Sint8(i8),
     Uint8(u8),
     Uint16(u16),
+    Sint32(i32),
     Uint32(u32),
     Uint32z(u32),
 }
@@ -59,6 +61,7 @@ impl Value {
             Value::Sint8(_) => 0x01,
             Value::Uint8(_) => 0x02,
             Value::Uint16(_) => 0x84,
+            Value::Sint32(_) => 0x85,
             Value::Uint32(_) => 0x86,
             Value::Uint32z(_) => 0x8C,
         }
@@ -68,7 +71,7 @@ impl Value {
         match self {
             Value::Enum(_) | Value::Sint8(_) | Value::Uint8(_) => 1,
             Value::Uint16(_) => 2,
-            Value::Uint32(_) | Value::Uint32z(_) => 4,
+            Value::Sint32(_) | Value::Uint32(_) | Value::Uint32z(_) => 4,
         }
     }
 
@@ -77,6 +80,7 @@ impl Value {
             Value::Enum(value) | Value::Uint8(value) => out.push(value),
             Value::Sint8(value) => out.push(value as u8),
             Value::Uint16(value) => out.extend(value.to_le_bytes()),
+            Value::Sint32(value) => out.extend(value.to_le_bytes()),
             Value::Uint32(value) | Value::Uint32z(value) => out.extend(value.to_le_bytes()),
         }
     }
@@ -201,6 +205,37 @@ struct Point {
     depth_m: f64,
     temp_c: Option<f64>,
     pressure_bar: Option<f64>,
+    ambient_mbar: Option<f64>,
+    /// Index of the sample this time falls under, for what the watch
+    /// counts in steps: no-deco time, deco stop, gas time...
+    sample: usize,
+}
+
+/// The FIT event a Descent logs for an alarm of the watch, as (event, data).
+/// Most are a dive alert, with the kind of alert as data. `None` for the
+/// alarms it has no counterpart of.
+fn alarm_event(alarm: &str) -> Option<(u8, Option<u32>)> {
+    const DIVE_ALERT: u8 = 56;
+    let alert = |kind: u32| Some((DIVE_ALERT, Some(kind)));
+    match alarm {
+        "nodeco_deco" => alert(0),                             // ndl_reached
+        "gas_switchpoint" => alert(1),                         // gas_switch_prompted
+        "nodeco_2min" => alert(3),                             // approaching_ndl
+        "mod_reached" => alert(4),                             // po2_warn
+        "divetime_halftime" | "divetime_fulltime" => alert(7), // time_alert
+        "max_dive_depth" => alert(8),                          // depth_alert
+        "missed_deco" | "dive_violation_deco" => alert(9),     // deco_ceiling_broken
+        "cns_danger" => alert(13),                             // cns_warning
+        "cns_extreme" => alert(14),                            // cns_critical
+        "fast_ascent" | "uncontrolled_ascent" => alert(17),    // ascent_critical
+        "low_battery" => alert(20),                            // battery_low
+        "very_low_battery" => alert(21),                       // battery_critical
+        "probe_low_battery" => alert(32),                      // tank_battery_low
+        "tank_reserve_reached" => Some((71, None)),            // tank_pressure_reserve
+        "low_tank_pressure" => Some((72, None)),               // tank_pressure_critical
+        "tank_lost_link" => Some((73, None)),                  // tank_lost
+        _ => None,
+    }
 }
 
 /// Tank pressure as stored in FIT: 1/100 bar.
@@ -214,11 +249,14 @@ fn resample(samples: &[Sample], interval: u32) -> Vec<Point> {
     if interval == 0 {
         return samples
             .iter()
-            .map(|sample| Point {
+            .enumerate()
+            .map(|(index, sample)| Point {
                 time_s: sample.time_s,
                 depth_m: sample.depth_m,
                 temp_c: sample.temp_c,
                 pressure_bar: sample.pressure_bar,
+                ambient_mbar: sample.ambient_mbar.map(f64::from),
+                sample: index,
             })
             .collect();
     }
@@ -250,6 +288,11 @@ fn resample(samples: &[Sample], interval: u32) -> Vec<Point> {
             depth_m: lerp(from.depth_m, to.depth_m),
             temp_c: lerp_some(from.temp_c, to.temp_c),
             pressure_bar: lerp_some(from.pressure_bar, to.pressure_bar),
+            ambient_mbar: lerp_some(
+                from.ambient_mbar.map(f64::from),
+                to.ambient_mbar.map(f64::from),
+            ),
+            sample: i,
         });
     }
     points
@@ -281,7 +324,11 @@ pub fn encode_dive(
     let begin = fit_time(start);
     let end = begin + elapsed_s;
 
-    let avg_depth = depth(points.iter().map(|p| p.depth_m).sum::<f64>() / points.len() as f64);
+    // The watch's own figures where it logs them, else worked out
+    let avg_depth =
+        depth(dive.avg_depth_m.unwrap_or_else(|| {
+            points.iter().map(|p| p.depth_m).sum::<f64>() / points.len() as f64
+        }));
     let max_depth = depth(
         points
             .iter()
@@ -301,14 +348,19 @@ pub fn encode_dive(
             (4, Value::Uint32(begin)), // time_created
         ],
     );
-    fit.message(
-        MESG_DEVICE_INFO,
-        &[
-            (TIMESTAMP, Value::Uint32(begin)),
+    let device_info = |timestamp: u32, battery: Option<u8>| {
+        let mut fields = vec![
+            (TIMESTAMP, Value::Uint32(timestamp)),
             (0, Value::Uint8(0)), // device_index: creator
             (2, Value::Uint16(MANUFACTURER_GARMIN)),
             (4, Value::Uint16(PRODUCT_DESCENT_MK3I)),
-        ],
+        ];
+        fields.extend(battery.map(|level| (32, Value::Uint8(level)))); // battery_level
+        fields
+    };
+    fit.message(
+        MESG_DEVICE_INFO,
+        &device_info(begin, dive.battery_start_pct),
     );
     fit.message(
         MESG_EVENT,
@@ -318,6 +370,31 @@ pub fn encode_dive(
             (1, Value::Enum(0)), // event_type: start
         ],
     );
+    if !dive.gradient_factors.is_empty() || dive.water.is_some() {
+        let mut settings = vec![(TIMESTAMP, Value::Uint32(begin))];
+        // The set in use when the dive starts
+        let set = dive.samples[0].gf_set as usize;
+        if let Some(gf) = dive
+            .gradient_factors
+            .get(set)
+            .or(dive.gradient_factors.first())
+        {
+            settings.extend([
+                (1, Value::Enum(0)),        // model: zhl_16c
+                (2, Value::Uint8(gf.low)),  // gf_low
+                (3, Value::Uint8(gf.high)), // gf_high
+            ]);
+        }
+        if let Some(water) = dive.water {
+            let water_type = match water {
+                Water::Fresh => 0,
+                Water::Salt => 1,
+                Water::En13319 => 2,
+            };
+            settings.push((4, Value::Enum(water_type)));
+        }
+        fit.message(MESG_DIVE_SETTINGS, &settings);
+    }
     for (i, gas) in dive.gas_mixes.iter().enumerate() {
         fit.message(
             MESG_DIVE_GAS,
@@ -330,19 +407,96 @@ pub fn encode_dive(
         );
     }
 
+    // A record has the same fields all along the dive: those the log has
+    // for some sample at least, with the "no value" of their type elsewhere
+    let logs = |has: fn(&Sample) -> bool| dive.samples.iter().any(has);
+    let with_ambient = logs(|s| s.ambient_mbar.is_some());
+    let with_speed = logs(|s| s.speed_m_min.is_some());
+    let with_deco = logs(|s| s.ndl_min.is_some() || s.deco_time_min.is_some());
+    let with_gas_time = logs(|s| s.gas_time_min.is_some());
+    let with_sac = logs(|s| s.sac_l_min.is_some());
+
+    // First sample whose alarms and gas are not yet written as events
+    let mut pending = 0;
     for point in &points {
-        fit.message(
-            MESG_RECORD,
-            &[
-                (TIMESTAMP, Value::Uint32(begin + point.time_s)),
-                (92, depth(point.depth_m)),
-                // temperature, in whole degrees C; 0x7F stands for no value
-                (
-                    13,
-                    Value::Sint8(point.temp_c.map_or(0x7F, |t| t.round() as i8)),
-                ),
-            ],
-        );
+        while pending <= point.sample {
+            let sample = &dive.samples[pending];
+            let before = pending.checked_sub(1).map(|i| &dive.samples[i]);
+            let timestamp = (TIMESTAMP, Value::Uint32(begin + sample.time_s));
+            let marker = (1, Value::Enum(3)); // event_type: marker
+
+            // An alarm is one event, when it comes up
+            let raised = |alarm: &&String| before.is_none_or(|b| !b.alarms.contains(alarm));
+            for (event, data) in sample
+                .alarms
+                .iter()
+                .filter(raised)
+                .filter_map(|alarm| alarm_event(alarm))
+            {
+                let mut fields = vec![timestamp, (0, Value::Enum(event)), marker];
+                fields.extend(data.map(|data| (3, Value::Uint32(data))));
+                fit.message(MESG_EVENT, &fields);
+            }
+            if before.is_some_and(|b| b.gas != sample.gas) {
+                fit.message(
+                    MESG_EVENT,
+                    &[
+                        timestamp,
+                        (0, Value::Enum(57)), // event: dive_gas_switched
+                        marker,
+                        (3, Value::Uint32(sample.gas as u32)), // data: the dive_gas message
+                    ],
+                );
+            }
+            pending += 1;
+        }
+
+        let sample = &dive.samples[point.sample];
+        let mut record = vec![
+            (TIMESTAMP, Value::Uint32(begin + point.time_s)),
+            (92, depth(point.depth_m)),
+            // temperature, in whole degrees C; 0x7F stands for no value
+            (
+                13,
+                Value::Sint8(point.temp_c.map_or(0x7F, |t| t.round() as i8)),
+            ),
+        ];
+        if with_ambient {
+            // absolute_pressure, in Pa
+            let pascals = point.ambient_mbar.map(|mbar| (mbar * 100.0).round() as u32);
+            record.push((91, Value::Uint32(pascals.unwrap_or(u32::MAX))));
+        }
+        if with_speed {
+            // ascent_rate, in mm/s, positive going up
+            let rate = sample
+                .speed_m_min
+                .map(|speed| (speed / 60.0 * 1000.0).round() as i32);
+            record.push((127, Value::Sint32(rate.unwrap_or(i32::MAX))));
+        }
+        if with_deco {
+            // In deco a Descent has no no-deco time left, out of deco no stop
+            let (ndl, stop_depth, stop_time) = match (sample.deco_time_min, sample.ndl_min) {
+                (Some(time), _) => (0, sample.deco_stop_m.unwrap_or(0) * 1000, time * 60),
+                (None, Some(ndl)) => (ndl * 60, 0, 0),
+                (None, None) => (u32::MAX, u32::MAX, u32::MAX),
+            };
+            record.extend([
+                (96, Value::Uint32(ndl)),        // ndl_time
+                (93, Value::Uint32(stop_depth)), // next_stop_depth
+                (94, Value::Uint32(stop_time)),  // next_stop_time
+            ]);
+        }
+        if with_gas_time {
+            // air_time_remaining
+            let seconds = sample.gas_time_min.map(|minutes| minutes * 60);
+            record.push((123, Value::Uint32(seconds.unwrap_or(u32::MAX))));
+        }
+        if with_sac {
+            // volume_sac, in 1/100 l/min
+            let sac = sample.sac_l_min.map(|sac| (sac * 100) as u16);
+            record.push((125, Value::Uint16(sac.unwrap_or(u16::MAX))));
+        }
+        fit.message(MESG_RECORD, &record);
         if let Some(bar) = point.pressure_bar {
             fit.message(
                 MESG_TANK_UPDATE,
@@ -364,17 +518,32 @@ pub fn encode_dive(
         ],
     );
 
+    if dive.battery_end_pct.is_some() {
+        fit.message(MESG_DEVICE_INFO, &device_info(end, dive.battery_end_pct));
+    }
+
+    // Tank pressures as the watch sums them up, else the first and last readings
     let mut pressures = points.iter().filter_map(|p| p.pressure_bar);
-    if let Some(first) = pressures.next() {
-        fit.message(
-            MESG_TANK_SUMMARY,
-            &[
-                (TIMESTAMP, Value::Uint32(end)),
-                (0, Value::Uint32z(TANK_SENSOR)),
-                (1, pressure(first)), // start_pressure
-                (2, pressure(pressures.next_back().unwrap_or(first))), // end_pressure
-            ],
-        );
+    let tank = dive.gas_mixes.iter().find_map(|gas| gas.tank.as_ref());
+    let first_and_last = match tank {
+        Some(tank) => Some((tank.start_bar, tank.end_bar)),
+        None => pressures
+            .next()
+            .map(|first| (first, pressures.next_back().unwrap_or(first))),
+    };
+    if let Some((first, last)) = first_and_last {
+        let mut summary = vec![
+            (TIMESTAMP, Value::Uint32(end)),
+            (0, Value::Uint32z(TANK_SENSOR)),
+            (1, pressure(first)), // start_pressure
+            (2, pressure(last)),  // end_pressure
+        ];
+        // volume_used, in 1/100 l: the pressure drop times the tank size
+        if let Some(litres) = tank.and_then(|tank| tank.volume_l) {
+            let used = ((first - last).max(0.0) * litres as f64 * 100.0).round() as u32;
+            summary.push((3, Value::Uint32(used)));
+        }
+        fit.message(MESG_TANK_SUMMARY, &summary);
     }
 
     // Lap and session number these fields alike
@@ -402,37 +571,54 @@ pub fn encode_dive(
     ]);
     if !temperatures.is_empty() {
         let degrees = |t: f64| Value::Sint8(t.round() as i8);
+        let max = temperatures.iter().copied().fold(f64::MIN, f64::max);
+        let min = temperatures.iter().copied().fold(f64::MAX, f64::min);
         session.extend([
             (
                 57,
                 degrees(temperatures.iter().sum::<f64>() / temperatures.len() as f64),
             ),
-            (
-                58,
-                degrees(temperatures.iter().copied().fold(f64::MIN, f64::max)),
-            ),
-            (
-                150,
-                degrees(temperatures.iter().copied().fold(f64::MAX, f64::min)),
-            ),
+            (58, degrees(dive.max_temp_c.unwrap_or(max))),
+            (150, degrees(dive.min_temp_c.unwrap_or(min))),
         ]);
     }
+    // Surface interval (0 when the watch counts none), CNS clock and OTU,
+    // which the session and the dive summary number differently
+    let interval = dive.surface_interval_s.filter(|&seconds| seconds > 0);
+    let percent = |cns: f64| Value::Uint8(cns.round() as u8);
+    let toxicity = |fields: [u8; 4]| {
+        let [surface_interval, start_cns, end_cns, o2_toxicity] = fields;
+        let mut values = Vec::new();
+        values.extend(interval.map(|seconds| (surface_interval, Value::Uint32(seconds))));
+        values.extend(dive.cns_start_pct.map(|cns| (start_cns, percent(cns))));
+        values.extend(dive.cns_end_pct.map(|cns| (end_cns, percent(cns))));
+        values.extend(
+            dive.otu_end
+                .map(|otu| (o2_toxicity, Value::Uint16(otu.round() as u16))),
+        );
+        values
+    };
+    session.extend(toxicity([142, 143, 144, 155]));
     fit.message(MESG_SESSION, &session);
 
     // A Descent writes one dive summary for the lap and one for the session
     for reference in [MESG_LAP, MESG_SESSION] {
-        fit.message(
-            MESG_DIVE_SUMMARY,
-            &[
-                (TIMESTAMP, Value::Uint32(end)),
-                (0, Value::Uint16(reference)), // reference_mesg
-                (1, Value::Uint16(0)),         // reference_index
-                (2, avg_depth),
-                (3, max_depth),
-                (10, Value::Uint32(dive.number)), // dive_number
-                (11, Value::Uint32(dive_time_s * 1000)), // bottom_time
-            ],
-        );
+        let mut summary = vec![
+            (TIMESTAMP, Value::Uint32(end)),
+            (0, Value::Uint16(reference)), // reference_mesg
+            (1, Value::Uint16(0)),         // reference_index
+            (2, avg_depth),
+            (3, max_depth),
+            (10, Value::Uint32(dive.number)),        // dive_number
+            (11, Value::Uint32(dive_time_s * 1000)), // bottom_time
+        ];
+        summary.extend(toxicity([4, 5, 6, 9]));
+        // max_ascent_rate, in mm/s
+        summary.extend(dive.max_ascent_speed_m_min.map(|speed| {
+            let rate = (speed / 60.0 * 1000.0).round() as u32;
+            (23, Value::Uint32(rate))
+        }));
+        fit.message(MESG_DIVE_SUMMARY, &summary);
     }
 
     fit.message(
@@ -657,6 +843,178 @@ mod tests {
         let summary = messages.iter().find(|message| message.0 == 323).unwrap();
         assert_eq!(field(summary, 0), TANK_SENSOR);
         assert_eq!((field(summary, 1), field(summary, 2)), (20_000, 18_050));
+    }
+
+    /// The test dive with what a newer log holds besides.
+    fn full_dive() -> DiveLog {
+        let mut dive = dive();
+        dive.avg_depth_m = Some(12.5);
+        dive.min_temp_c = Some(18.2);
+        dive.max_temp_c = Some(21.0);
+        dive.water = Some(Water::Salt);
+        dive.surface_interval_s = Some(16180);
+        dive.cns_start_pct = Some(0.21);
+        dive.cns_end_pct = Some(5.65);
+        dive.otu_end = Some(14.62);
+        dive.gradient_factors = vec![
+            GradientFactors { low: 85, high: 80 },
+            GradientFactors { low: 95, high: 90 },
+        ];
+        dive.max_ascent_speed_m_min = Some(14.9);
+        dive.battery_start_pct = Some(58);
+        dive.battery_end_pct = Some(53);
+        dive.gas_mixes[0].tank = Some(Tank {
+            start_bar: 209.1,
+            end_bar: 99.0,
+            volume_l: Some(12),
+            working_bar: Some(200),
+        });
+
+        // 10 s: within the no-deco limit, the transmitter not heard yet
+        let bottom = &mut dive.samples[0];
+        bottom.ambient_mbar = Some(1500);
+        bottom.speed_m_min = Some(-3.0);
+        bottom.ndl_min = Some(17);
+        bottom.alarms = vec!["tank_lost_link".to_string(), "slow_down".to_string()];
+
+        // 20 s: into deco, on the second gas
+        let deco = &mut dive.samples[1];
+        deco.ambient_mbar = Some(3000);
+        deco.speed_m_min = Some(7.2);
+        deco.deco_time_min = Some(2);
+        deco.deco_stop_m = Some(3);
+        deco.gas = 1;
+        deco.pressure_bar = Some(150.0);
+        deco.gas_time_min = Some(28);
+        deco.sac_l_min = Some(18);
+        deco.alarms = vec!["tank_lost_link".to_string(), "nodeco_deco".to_string()];
+
+        // 30 s: nothing but depth, and the gas in use
+        dive.samples[2].gas = 1;
+        dive
+    }
+
+    #[test]
+    fn summary_carries_the_figures_of_the_watch() {
+        let begin = fit_time(start());
+        let messages = decode(&encode_dive(&full_dive(), start(), 0, 0).unwrap());
+        let find = |global: u16| messages.iter().find(|message| message.0 == global).unwrap();
+
+        let session = find(18);
+        assert_eq!(field(session, 140), 12_500); // avg_depth, not the 9 m of the samples
+        assert_eq!((field(session, 150), field(session, 58)), (18, 21));
+        assert_eq!(field(session, 142), 16180); // surface_interval
+        assert_eq!((field(session, 143), field(session, 144)), (0, 6)); // CNS
+        assert_eq!(field(session, 155), 15); // o2_toxicity
+
+        let summary = find(268);
+        assert_eq!(field(summary, 2), 12_500);
+        assert_eq!(field(summary, 4), 16180);
+        assert_eq!((field(summary, 5), field(summary, 6)), (0, 6));
+        assert_eq!(field(summary, 9), 15);
+        assert_eq!(field(summary, 23), 248); // max_ascent_rate: 14.9 m/min in mm/s
+
+        // dive_settings: Buhlmann with the first gradient factor set, salt water
+        let settings = find(258);
+        assert_eq!(field(settings, 1), 0);
+        assert_eq!((field(settings, 2), field(settings, 3)), (85, 80));
+        assert_eq!(field(settings, 4), 1);
+
+        // device_info: battery at the start, then at the end
+        let battery: Vec<(u32, u32)> = messages
+            .iter()
+            .filter(|message| message.0 == 23)
+            .map(|message| (field(message, 253) - begin, field(message, 32)))
+            .collect();
+        assert_eq!(battery, [(0, 58), (1800, 53)]);
+
+        // tank_summary: the pressures of the header, 110.1 bar out of 12 l
+        let tank = find(323);
+        assert_eq!((field(tank, 1), field(tank, 2)), (20_910, 9_900));
+        assert_eq!(field(tank, 3), 132_120);
+    }
+
+    #[test]
+    fn records_carry_deco_and_gas_data() {
+        let messages = decode(&encode_dive(&full_dive(), start(), 0, 0).unwrap());
+        let records: Vec<&Message> = messages.iter().filter(|message| message.0 == 20).collect();
+        let [bottom, deco, last] = records[..] else {
+            panic!("expected 3 records, got {}", records.len());
+        };
+
+        assert_eq!(field(bottom, 91), 150_000); // absolute_pressure, Pa
+        assert_eq!(field(bottom, 127) as i32, -50); // ascent_rate: -3 m/min in mm/s
+                                                    // ndl_time, with no stop
+        assert_eq!(
+            (field(bottom, 96), field(bottom, 93), field(bottom, 94)),
+            (1020, 0, 0)
+        );
+        // no gas time before the transmitter is heard
+        assert_eq!((field(bottom, 123), field(bottom, 125)), (u32::MAX, 0xFFFF));
+
+        assert_eq!(field(deco, 127), 120);
+        // no no-deco time left: a stop of 2 minutes at 3 m
+        assert_eq!(
+            (field(deco, 96), field(deco, 93), field(deco, 94)),
+            (0, 3000, 120)
+        );
+        assert_eq!((field(deco, 123), field(deco, 125)), (1680, 1800));
+
+        // what the last sample lacks is written as "no value"
+        assert_eq!(
+            (field(last, 91), field(last, 127)),
+            (u32::MAX, i32::MAX as u32)
+        );
+        assert_eq!(field(last, 96), u32::MAX);
+    }
+
+    #[test]
+    fn records_take_the_step_values_of_the_sample_before() {
+        // At one record per 5 s: 15 s still falls under the sample of 10 s
+        let messages = decode(&encode_dive(&full_dive(), start(), 0, 5).unwrap());
+        let records: Vec<&Message> = messages.iter().filter(|message| message.0 == 20).collect();
+        assert_eq!(records.len(), 5);
+
+        assert_eq!(field(records[1], 96), 1020);
+        // while the pressure between the two is interpolated
+        assert_eq!(field(records[1], 91), 225_000);
+        assert_eq!((field(records[2], 96), field(records[2], 94)), (0, 120));
+    }
+
+    #[test]
+    fn alarms_and_gas_switches_become_events() {
+        let begin = fit_time(start());
+        let messages = decode(&encode_dive(&full_dive(), start(), 0, 1).unwrap());
+
+        // Without the timer start and stop: (seconds, event, data)
+        let data = |message: &Message| {
+            message
+                .1
+                .iter()
+                .find(|field| field.0 == 3)
+                .map(|field| field.1)
+        };
+        let events: Vec<(u32, u32, Option<u32>)> = messages
+            .iter()
+            .filter(|message| message.0 == 21 && field(message, 1) == 3)
+            .map(|message| {
+                (
+                    field(message, 253) - begin,
+                    field(message, 0),
+                    data(message),
+                )
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [
+                // tank_lost, once though it lasts; no event for "slow down"
+                (10, 73, None),
+                // dive_alert ndl_reached, then dive_gas_switched to gas 1
+                (20, 56, Some(0)),
+                (20, 57, Some(1)),
+            ]
+        );
     }
 
     #[test]
