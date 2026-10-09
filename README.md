@@ -11,6 +11,7 @@ Rust CLI tool that extracts dive logs from Mares Sirius dive computers via Bluet
 - **Parse** previously saved raw binary data offline
 - **Correlate** with SSI dive log CSV exports to import dive site, country, and buddy info
 - **View** dive logs in an interactive TUI with depth/temperature/pressure charts
+- **Export** dives as FIT activities, for apps that overlay Garmin Descent dive data on video
 
 ## Supported Devices
 
@@ -75,6 +76,20 @@ sirius-dive view
 ```
 
 Navigate with `j`/`k` or arrow keys. Toggle overlays with `d` (depth), `t` (temperature), `p` (pressure). Quit with `q`.
+
+### Export to FIT
+
+Write each dive as a FIT activity file laid out like a dive from a Garmin Descent (sport `diving`, depth in the records, tank pressure as `tank_update` messages, a `dive_summary`). The Insta360 app can import such files for its stats dashboard:
+
+```bash
+sirius-dive fit                               # every dive of dives.json, into fit/
+sirius-dive fit -d 2026-10-05                 # the dives of one day
+sirius-dive fit -n 143 --utc-offset +03:00 --offset 20
+```
+
+FIT timestamps are in UTC, while the dive log is in the local time of the dive computer. `--utc-offset` gives the time zone its clock was set to; the default is the time zone of this machine on the day of the dive. `--offset` adds seconds to the start time, which the log only keeps to the minute.
+
+The profile is interpolated to one record per second, as a Descent logs it; `--interval 0` writes the samples as logged. The files name a Garmin Descent Mk3i as their source.
 
 ## Protocol
 

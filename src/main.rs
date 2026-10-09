@@ -1,4 +1,5 @@
 mod ble;
+mod fit;
 mod parser;
 mod protocol;
 mod tui;
@@ -125,6 +126,42 @@ enum Commands {
         start: Option<chrono::NaiveDateTime>,
     },
 
+    /// Export dives as FIT activities that look like Garmin Descent dives,
+    /// e.g. for the stats dashboard of the Insta360 app (offline, no BLE needed)
+    Fit {
+        /// Input JSON file with dive data
+        #[arg(short, long, default_value = "dives.json")]
+        json: PathBuf,
+
+        /// Directory to write one .fit file per dive into
+        #[arg(short, long, default_value = "fit")]
+        output: PathBuf,
+
+        /// Only export the dives of this day, as YYYY-MM-DD
+        #[arg(short, long)]
+        date: Option<chrono::NaiveDate>,
+
+        /// Only export the dives with this number
+        #[arg(short, long)]
+        number: Option<u32>,
+
+        /// Time zone the dive computer's clock was set to, as an offset from
+        /// UTC such as "+02:00". Defaults to this machine's time zone on the
+        /// day of the dive. FIT timestamps are in UTC.
+        #[arg(long, allow_hyphen_values = true)]
+        utc_offset: Option<chrono::FixedOffset>,
+
+        /// Time offset in seconds added to the dive start time, which the log
+        /// only keeps to the minute (as for watermark).
+        #[arg(long, default_value = "0", allow_hyphen_values = true)]
+        offset: i64,
+
+        /// Seconds between records: the profile is interpolated, as a Descent
+        /// logs every second. 0 writes the samples as logged.
+        #[arg(long, default_value = "1")]
+        interval: u32,
+    },
+
     /// Parse previously downloaded raw dive data (offline, no BLE needed)
     Parse {
         /// Directory containing raw dive data (dive_NNN_header.bin / dive_NNN_profile.bin)
@@ -207,6 +244,15 @@ async fn main() -> Result<()> {
             offset,
             start,
         } => cmd_watermark(video, json, offset, start),
+        Commands::Fit {
+            json,
+            output,
+            date,
+            number,
+            utc_offset,
+            offset,
+            interval,
+        } => cmd_fit(json, output, date, number, utc_offset, offset, interval),
         Commands::Parse {
             raw_dir,
             output,
@@ -1218,6 +1264,76 @@ fn cmd_watermark(
     }
 
     eprintln!("Output: {}", output_path.display());
+    Ok(())
+}
+
+// ── FIT export ──
+
+/// UTC offset of this machine's time zone at a local time.
+fn local_utc_offset(datetime: chrono::NaiveDateTime) -> chrono::FixedOffset {
+    use chrono::TimeZone;
+
+    chrono::Local
+        .offset_from_local_datetime(&datetime)
+        .earliest()
+        // A time skipped by a clock change has no offset of its own
+        .unwrap_or_else(|| chrono::Local.offset_from_utc_datetime(&datetime))
+}
+
+fn cmd_fit(
+    json: PathBuf,
+    output: PathBuf,
+    date: Option<chrono::NaiveDate>,
+    number: Option<u32>,
+    utc_offset: Option<chrono::FixedOffset>,
+    offset: i64,
+    interval: u32,
+) -> Result<()> {
+    let contents = std::fs::read_to_string(&json)
+        .with_context(|| format!("Failed to read {}", json.display()))?;
+    let data: DiveData = serde_json::from_str(&contents)
+        .with_context(|| format!("Failed to parse {}", json.display()))?;
+
+    let dives: Vec<&DiveLog> = data
+        .dives
+        .iter()
+        .filter(|dive| date.is_none_or(|date| dive.datetime.date() == date))
+        .filter(|dive| number.is_none_or(|number| dive.number == number))
+        .collect();
+    if dives.is_empty() {
+        anyhow::bail!("No matching dive in {}", json.display());
+    }
+
+    std::fs::create_dir_all(&output)?;
+    let mut exported = 0;
+    for dive in dives {
+        let zone = utc_offset.unwrap_or_else(|| local_utc_offset(dive.datetime));
+        let start = dive.datetime - zone + chrono::Duration::seconds(offset);
+
+        let file = match fit::encode_dive(dive, start, zone.local_minus_utc(), interval) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("  Dive #{}: {e}, skipping", dive.number);
+                continue;
+            }
+        };
+        let path = output.join(format!(
+            "{}_dive_{:03}.fit",
+            dive.datetime.format("%Y-%m-%d_%Hh%M"),
+            dive.number
+        ));
+        std::fs::write(&path, file)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        eprintln!(
+            "  Dive #{}: {} UTC{zone} -> {}",
+            dive.number,
+            dive.datetime.format("%Y-%m-%d %H:%M"),
+            path.display()
+        );
+        exported += 1;
+    }
+    eprintln!("Exported {exported} dive(s) to {}", output.display());
+
     Ok(())
 }
 
