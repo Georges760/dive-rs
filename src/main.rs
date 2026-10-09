@@ -5,7 +5,7 @@ mod protocol;
 mod tui;
 mod types;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -141,7 +141,7 @@ enum Commands {
         #[arg(short, long)]
         date: Option<chrono::NaiveDate>,
 
-        /// Only export the dives with this number
+        /// Only export the dive with this number in the logbook, as the viewer shows it
         #[arg(short, long)]
         number: Option<u32>,
 
@@ -522,7 +522,8 @@ async fn cmd_download(
         match std::fs::read_to_string(&output) {
             Ok(contents) => match serde_json::from_str::<DiveData>(&contents) {
                 Ok(data) => {
-                    for dive in &data.dives {
+                    // Dives from a logbook have no number of their own
+                    for dive in data.dives.iter().filter(|dive| !dive.is_logbook_only()) {
                         existing_numbers.insert(dive.number);
                     }
                     eprintln!(
@@ -649,7 +650,7 @@ async fn cmd_download(
     // Merge existing + new dives
     let mut all_dives = existing_dives;
     all_dives.append(&mut new_dives);
-    all_dives.sort_by_key(|d| d.number);
+    all_dives.sort_by_key(|d| (d.datetime, d.number));
 
     if all_dives.is_empty() {
         eprintln!("No dives could be parsed.");
@@ -764,6 +765,17 @@ struct SsiRecord {
     site: String,
     country: String,
     buddy: String,
+    freedive: bool,
+    duration_s: u32,
+    max_depth_m: f64,
+}
+
+/// The number a field starts with, as in "45 min" or "18.2 m (60 ft)".
+fn leading_number(field: &str) -> Option<f64> {
+    let end = field
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(field.len());
+    field[..end].parse().ok()
 }
 
 /// Parse a CSV line handling quoted fields with escaped quotes.
@@ -798,14 +810,66 @@ fn parse_csv_line(line: &str) -> Vec<String> {
     fields
 }
 
-/// Clean buddy field: normalize whitespace, strip trailing "Sirius"/"Mares", trim.
-fn clean_buddy(raw: &str) -> String {
-    let normalized: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = normalized
-        .trim_end_matches("Sirius")
-        .trim_end_matches("Mares")
-        .trim();
-    trimmed.to_string()
+/// What the SSI export lists among the buddies for the dive computer.
+const SSI_DIVE_COMPUTERS: [&str; 3] = ["Sirius", "Mares Sirius", "Mares"];
+
+/// The blocks of the SSI buddy column: the buddies, the dive center, the
+/// dive computer. Runs of blanks keep them apart; the computer is left out.
+fn buddy_blocks(raw: &str) -> Vec<String> {
+    raw.replace('\t', "  ")
+        .split("  ")
+        .map(|block| block.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|block| !block.is_empty() && !SSI_DIVE_COMPUTERS.contains(&block.as_str()))
+        .collect()
+}
+
+/// Find the blocks that hold several names. The export glues the buddies of
+/// a dive to one another, as in "Serge MASAxel Brosse", but each of them
+/// shows on its own, or next to others, elsewhere in the logbook: a block
+/// that starts or ends with another one is that name and more names.
+///
+/// Returns the two parts of every block that splits, themselves blocks to
+/// look up in turn.
+fn glued_names(blocks: &BTreeSet<String>) -> HashMap<String, (String, String)> {
+    let mut names = blocks.clone();
+    let mut parts = HashMap::new();
+    loop {
+        // The rest of a block is a name when it is known as one, or has the
+        // two words of a name; "Serge MASSON" is not "Serge MAS" and "SON"
+        let name = |rest: &str| names.contains(rest) || rest.contains(' ');
+        let split = names.iter().find_map(|block| {
+            names.iter().find_map(|other| {
+                // Glued names have no blank where they meet: with one, the
+                // block is a longer name of its own ("Dive Systems Malta")
+                let ahead = block.strip_prefix(other.as_str());
+                let behind = block.strip_suffix(other.as_str());
+                if let Some(rest) = ahead.filter(|rest| !rest.starts_with(' ') && name(rest)) {
+                    Some((block.clone(), other.clone(), rest.to_string()))
+                } else {
+                    let rest = behind.filter(|rest| !rest.ends_with(' ') && name(rest))?;
+                    Some((block.clone(), rest.to_string(), other.clone()))
+                }
+            })
+        });
+        let Some((block, first, second)) = split else {
+            return parts;
+        };
+        names.remove(&block);
+        names.insert(first.clone());
+        names.insert(second.clone());
+        parts.insert(block, (first, second));
+    }
+}
+
+/// The names of a block, in order, given the blocks that split.
+fn names_of(block: &str, parts: &HashMap<String, (String, String)>, names: &mut Vec<String>) {
+    match parts.get(block) {
+        Some((first, second)) => {
+            names_of(first, parts, names);
+            names_of(second, parts, names);
+        }
+        None => names.push(block.to_string()),
+    }
 }
 
 /// Parse SSI CSV export into records.
@@ -821,12 +885,20 @@ fn parse_ssi_csv(contents: &str) -> Vec<SsiRecord> {
 
     let col = |name: &str| headers.iter().position(|h| h == name);
 
-    let date_col = col("Date / Temps").unwrap_or(3);
+    // The export has named the date column both ways
+    let date_col = col("Date / Temps")
+        .or_else(|| col("Date / Heure"))
+        .unwrap_or(3);
     let site_col = col("Site de plongée").unwrap_or(1);
     let country_col = col("Pays").unwrap_or(2);
     let buddy_col = col("Equipier / Instructor / Center").unwrap_or(9);
+    let activity_col = col("Type d'activité de plongée").unwrap_or(4);
+    let duration_col = col("Durée").unwrap_or(7);
+    let depth_col = col("Profondeur").unwrap_or(8);
 
     let mut records = Vec::new();
+    // The blocks of the buddy column, record by record
+    let mut blocks = Vec::new();
     for (line_num, line) in lines.enumerate() {
         let fields = parse_csv_line(line);
         let max_col = *[date_col, site_col, country_col, buddy_col]
@@ -857,12 +929,31 @@ fn parse_ssi_csv(contents: &str) -> Vec<SsiRecord> {
             }
         };
 
+        // What only an imported dive needs; a freedive has no duration
+        let field = |col: usize| fields.get(col).map_or("", |field| field.trim());
+        let minutes = leading_number(field(duration_col)).unwrap_or(0.0);
+
+        blocks.push(buddy_blocks(&fields[buddy_col]));
         records.push(SsiRecord {
             datetime,
             site: fields[site_col].trim().to_string(),
             country: fields[country_col].trim().to_string(),
-            buddy: clean_buddy(&fields[buddy_col]),
+            buddy: String::new(),
+            freedive: field(activity_col).contains("Apnée"),
+            duration_s: (minutes * 60.0) as u32,
+            max_depth_m: leading_number(field(depth_col)).unwrap_or(0.0),
         });
+    }
+
+    // Buddies and dive center, one name after the other. Which blocks hold
+    // several names only shows with the whole logbook at hand.
+    let parts = glued_names(&blocks.iter().flatten().cloned().collect());
+    for (record, blocks) in records.iter_mut().zip(&blocks) {
+        let mut names = Vec::new();
+        for block in blocks {
+            names_of(block, &parts, &mut names);
+        }
+        record.buddy = names.join(", ");
     }
 
     records
@@ -921,6 +1012,13 @@ fn cmd_correlate(csv_path: PathBuf, json_path: PathBuf) -> Result<()> {
             }
             if !ssi.buddy.is_empty() {
                 dive.buddy = Some(ssi.buddy.clone());
+            } else if dive
+                .buddy
+                .as_deref()
+                .is_some_and(|buddy| SSI_DIVE_COMPUTERS.contains(&buddy))
+            {
+                // An earlier version took the dive computer for a buddy
+                dive.buddy = None;
             }
             matched += 1;
         } else {
@@ -931,6 +1029,54 @@ fn cmd_correlate(csv_path: PathBuf, json_path: PathBuf) -> Result<()> {
     eprintln!("Matched: {}, Unmatched: {}", matched, unmatched);
     if ignored > 0 {
         eprintln!("Left out {ignored} ignored dive(s)");
+    }
+
+    // An SSI entry with no dive at its minute is a dive no dive computer
+    // handed over: import it, with what the logbook says about it
+    let mut known: HashSet<chrono::NaiveDateTime> =
+        data.dives.iter().map(|dive| dive.datetime).collect();
+    let mut imported = Vec::new();
+    for record in &ssi_records {
+        if !known.insert(record.datetime) {
+            continue;
+        }
+        // A dive under way at that time is the same dive, logged with
+        // another start: importing it would list it twice
+        let seconds = |seconds: u32| chrono::Duration::seconds(seconds.max(60) as i64);
+        let under_way = data.dives.iter().find(|dive| {
+            !dive.is_logbook_only()
+                && dive.datetime < record.datetime + seconds(record.duration_s)
+                && record.datetime < dive.datetime + seconds(dive.duration_seconds)
+        });
+        if let Some(dive) = under_way {
+            eprintln!(
+                "  Not imported: the SSI entry of {} overlaps the dive of {}",
+                record.datetime.format("%Y-%m-%d %H:%M"),
+                dive.datetime.format("%H:%M")
+            );
+            continue;
+        }
+
+        let filled = |text: &String| (!text.is_empty()).then(|| text.clone());
+        imported.push(DiveLog {
+            datetime: record.datetime,
+            duration_seconds: record.duration_s,
+            max_depth_m: record.max_depth_m,
+            dive_mode: if record.freedive {
+                DiveMode::Freedive
+            } else {
+                DiveMode::Air
+            },
+            site: filled(&record.site),
+            country: filled(&record.country),
+            buddy: filled(&record.buddy),
+            ..Default::default()
+        });
+    }
+    if !imported.is_empty() {
+        eprintln!("Imported {} dive(s) from the SSI logbook", imported.len());
+        data.dives.append(&mut imported);
+        data.dives.sort_by_key(|dive| (dive.datetime, dive.number));
     }
 
     // Write back
@@ -1035,9 +1181,17 @@ fn find_overlapping_dive(
 ) -> Result<&DiveLog> {
     let video_end = video_start + chrono::Duration::milliseconds((video_duration * 1000.0) as i64);
 
-    let mut best: Option<(&DiveLog, i64)> = None;
+    // What the viewer calls the dive: its number in the logbook, if it has one
+    let numbers = logbook_numbers(dives);
+    let name = |dive: usize| numbers[dive].map_or("ignored dive".to_string(), |n| format!("#{n}"));
 
-    for dive in dives {
+    let mut best: Option<(usize, i64)> = None;
+
+    // A dive from a logbook has no profile to overlay
+    for (index, dive) in dives.iter().enumerate() {
+        if dive.is_logbook_only() {
+            continue;
+        }
         let dive_start = dive.datetime + chrono::Duration::seconds(offset);
         let dive_end = dive_start + chrono::Duration::seconds(dive.duration_seconds as i64);
 
@@ -1046,15 +1200,16 @@ fn find_overlapping_dive(
         let overlap = (overlap_end - overlap_start).num_seconds();
 
         if overlap > 0 && (best.is_none() || overlap > best.unwrap().1) {
-            best = Some((dive, overlap));
+            best = Some((index, overlap));
         }
     }
 
     match best {
-        Some((dive, overlap)) => {
+        Some((index, overlap)) => {
+            let dive = &dives[index];
             eprintln!(
-                "Matched dive #{} ({}) — {:.0}s overlap",
-                dive.number,
+                "Matched dive {} ({}) — {:.0}s overlap",
+                name(index),
                 dive.datetime.format("%Y-%m-%d %H:%M"),
                 overlap
             );
@@ -1065,18 +1220,19 @@ fn find_overlapping_dive(
             eprintln!("Video time range: {} to {}", video_start, video_end);
             let same_day: Vec<_> = dives
                 .iter()
-                .filter(|d| d.datetime.date() == video_date)
+                .enumerate()
+                .filter(|(_, d)| d.datetime.date() == video_date && !d.is_logbook_only())
                 .collect();
             if same_day.is_empty() {
                 eprintln!("No dives found on {video_date}.");
             } else {
                 eprintln!("Dives on {video_date}:");
-                for dive in &same_day {
+                for &(index, dive) in &same_day {
                     let dive_end =
                         dive.datetime + chrono::Duration::seconds(dive.duration_seconds as i64);
                     eprintln!(
-                        "  #{}: {} to {}",
-                        dive.number,
+                        "  {}: {} to {}",
+                        name(index),
                         dive.datetime.format("%H:%M:%S"),
                         dive_end.format("%H:%M:%S")
                     );
@@ -1299,13 +1455,22 @@ fn cmd_fit(
     let data: DiveData = serde_json::from_str(&contents)
         .with_context(|| format!("Failed to parse {}", json.display()))?;
 
-    // Dives ignored in the viewer are not exported, even when asked for
-    let (ignored, dives): (Vec<&DiveLog>, Vec<&DiveLog>) = data
+    // Dives go by their number in the logbook. Those ignored in the viewer
+    // have none and are not exported; those that come from a logbook only
+    // have no profile to export.
+    let numbers = logbook_numbers(&data.dives);
+    let (ignored, dives): (Vec<_>, Vec<_>) = data
         .dives
         .iter()
-        .filter(|dive| date.is_none_or(|date| dive.datetime.date() == date))
-        .filter(|dive| number.is_none_or(|number| dive.number == number))
-        .partition(|dive| dive.ignored);
+        .zip(&numbers)
+        .filter(|(dive, _)| !dive.is_logbook_only())
+        .filter(|(dive, _)| date.is_none_or(|date| dive.datetime.date() == date))
+        .filter(|(_, n)| number.is_none_or(|number| **n == Some(number)))
+        .partition(|(dive, _)| dive.ignored);
+    let dives = dives
+        .into_iter()
+        .filter_map(|(dive, n)| Some((dive, (*n)?)));
+    let dives: Vec<(&DiveLog, u32)> = dives.collect();
     if !ignored.is_empty() {
         eprintln!("Left out {} ignored dive(s)", ignored.len());
     }
@@ -1315,27 +1480,26 @@ fn cmd_fit(
 
     std::fs::create_dir_all(&output)?;
     let mut exported = 0;
-    for dive in dives {
+    for (dive, number) in dives {
         let zone = utc_offset.unwrap_or_else(|| local_utc_offset(dive.datetime));
         let start = dive.datetime - zone + chrono::Duration::seconds(offset);
 
-        let file = match fit::encode_dive(dive, start, zone.local_minus_utc(), interval) {
+        let file = match fit::encode_dive(dive, number, start, zone.local_minus_utc(), interval) {
             Ok(file) => file,
             Err(e) => {
-                eprintln!("  Dive #{}: {e}, skipping", dive.number);
+                eprintln!("  Dive #{number}: {e}, skipping");
                 continue;
             }
         };
         let path = output.join(format!(
             "{}_dive_{:03}.fit",
             dive.datetime.format("%Y-%m-%d_%Hh%M"),
-            dive.number
+            number
         ));
         std::fs::write(&path, file)
             .with_context(|| format!("Failed to write {}", path.display()))?;
         eprintln!(
-            "  Dive #{}: {} UTC{zone} -> {}",
-            dive.number,
+            "  Dive #{number}: {} UTC{zone} -> {}",
             dive.datetime.format("%Y-%m-%d %H:%M"),
             path.display()
         );
@@ -1393,6 +1557,7 @@ mod tests {
                 .unwrap()
                 .and_hms_opt(hour, 21, 0)
                 .unwrap(),
+            duration_seconds: 2700,
             samples: vec![Sample {
                 depth_m: 5.0,
                 ..Default::default()
@@ -1449,10 +1614,135 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(files, ["2025-10-26_12h21_dive_048.fit"]);
+        // The first dive of the logbook, the ignored one not being counted
+        assert_eq!(files, ["2025-10-26_12h21_dive_001.fit"]);
 
-        // Asked for by number, the ignored dive is still left out
+        // which has no number to ask for it by
         assert!(cmd_fit(json, output, None, Some(47), None, 0, 1).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn correlate_imports_the_dives_only_the_logbook_has() {
+        let dir = scratch("import");
+        let (json, ssi) = (dir.join("dives.json"), dir.join("ssi.csv"));
+        write_dives(&json);
+        std::fs::write(
+            &ssi,
+            concat!(
+                "\"plongée #\",\"Site de plongée\",\"Pays\",\"Date / Heure\",",
+                "\"Type d'activité de plongée\",\"Plongée de Spécialité\",\"Type de plongée\",",
+                "\"Durée\",\"Profondeur\",\"Equipier / Instructor / Center\"\n",
+                // The dive of the watch
+                "\"100\",\"Red Rocks\",\"Croatie\",\"26. Oct 2025 12:21\",\"Plongée Récréative\",",
+                "\"\",\"Exploration\",\"45 min\",\"24 m \t\t(79 ft)\",\"Venus\"\n",
+                // The same dive entered again, nine minutes into it
+                "\"101\",\"Elsewhere\",\"\",\"26. Oct 2025 12:30\",\"Plongée Récréative\",",
+                "\"\",\"\",\"40 min\",\"20 m\",\"\"\n",
+                // Two dives from before the watch
+                "\"12\",\"La muraillette\",\"France\",\"18. Jun 2022 11:54\",\"Plongée Récréative\",",
+                "\"\",\"Exploration\",\"31 min\",\"18.2 m \t\t(60 ft)\",\"Sirius\"\n",
+                "\"5\",\"Fosse\",\"France\",\"30. Mar 2022 16:22\",\"Apnée\",",
+                "\"\",\"\",\"CWT\",\"7 m\",\"Serge MASAxel Brosse \t\t  Argonaute \t Mares Sirius\"\n",
+                // Not a dive of its own: it only tells who Serge MAS is
+                "\"102\",\"Red Rocks\",\"\",\"26. Oct 2025 12:21\",\"\",\"\",\"\",\"\",\"\",\"Serge MAS\"\n",
+            ),
+        )
+        .unwrap();
+
+        cmd_correlate(ssi.clone(), json.clone()).unwrap();
+
+        // In the file by date: the two imported dives, which the watch has
+        // no number for, then its own
+        let dives = read_dives(&json);
+        let numbers: Vec<u32> = dives.iter().map(|dive| dive.number).collect();
+        assert_eq!(numbers, [0, 0, 47, 48]);
+        // In the logbook they come first, the ignored dive not being counted
+        assert_eq!(logbook_numbers(&dives), [Some(1), Some(1), None, Some(2)]);
+
+        let freedive = &dives[0];
+        assert_eq!(freedive.dive_mode, DiveMode::Freedive);
+        assert_eq!((freedive.duration_seconds, freedive.max_depth_m), (0, 7.0));
+        // The buddies glued to one another, then the dive center
+        assert_eq!(
+            freedive.buddy.as_deref(),
+            Some("Serge MAS, Axel Brosse, Argonaute")
+        );
+
+        let scuba = &dives[1];
+        assert_eq!(scuba.datetime.to_string(), "2022-06-18 11:54:00");
+        assert_eq!((scuba.duration_seconds, scuba.max_depth_m), (1860, 18.2));
+        assert_eq!(scuba.site.as_deref(), Some("La muraillette"));
+        assert_eq!(scuba.country.as_deref(), Some("France"));
+        // "Sirius" alone in the buddy column is the dive computer, not a buddy
+        assert_eq!(scuba.buddy, None);
+        assert!(scuba.samples.is_empty() && !scuba.ignored);
+
+        assert_eq!(dives[3].site.as_deref(), Some("Red Rocks"));
+        assert_eq!(dives[3].buddy.as_deref(), Some("Serge MAS"));
+
+        // A second run finds them all in place
+        cmd_correlate(ssi, json.clone()).unwrap();
+        assert_eq!(read_dives(&json).len(), 4);
+
+        // With no profile, the imported dives are not for the FIT export
+        let output = dir.join("fit");
+        cmd_fit(json, output.clone(), None, None, None, 0, 1).unwrap();
+        assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn buddies_glued_together_are_told_apart() {
+        let blocks: BTreeSet<String> = [
+            "Serge MAS",
+            "Serge MASAxel Brosse",
+            "Matthieu Martinez",
+            "Matthieu Martinezpaul cochet",
+            "paul cochetJeremie RahmMatthieu Martinez",
+            // Not "Serge MAS" and more: a name of its own
+            "Serge MASSON",
+            // nor "Dive Systems" and "Malta"
+            "Dive Systems",
+            "Dive Systems Malta",
+        ]
+        .map(String::from)
+        .into();
+        let parts = glued_names(&blocks);
+        let names = |block: &str| {
+            let mut names = Vec::new();
+            names_of(block, &parts, &mut names);
+            names.join(", ")
+        };
+
+        assert_eq!(names("Serge MASAxel Brosse"), "Serge MAS, Axel Brosse");
+        // A name in lower case, learnt from another dive
+        assert_eq!(
+            names("Matthieu Martinezpaul cochet"),
+            "Matthieu Martinez, paul cochet"
+        );
+        assert_eq!(
+            names("paul cochetJeremie RahmMatthieu Martinez"),
+            "paul cochet, Jeremie Rahm, Matthieu Martinez"
+        );
+        assert_eq!(names("Serge MASSON"), "Serge MASSON");
+        assert_eq!(names("Dive Systems Malta"), "Dive Systems Malta");
+    }
+
+    #[test]
+    fn buddy_column_is_cut_at_the_runs_of_blanks() {
+        assert_eq!(
+            buddy_blocks("Richard Puntous\t\t\t        LAGUNE PLONGEE   \t Sirius"),
+            ["Richard Puntous", "LAGUNE PLONGEE"]
+        );
+        assert!(buddy_blocks("  \t Mares Sirius").is_empty());
+    }
+
+    #[test]
+    fn number_at_the_start_of_a_field() {
+        assert_eq!(leading_number("45 min"), Some(45.0));
+        assert_eq!(leading_number("18.2 m \t(60 ft)"), Some(18.2));
+        assert_eq!(leading_number("24 m(79 ft)"), Some(24.0));
+        assert_eq!(leading_number("CWT"), None);
     }
 }

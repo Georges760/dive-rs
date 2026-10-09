@@ -11,13 +11,15 @@ use blit_tui::text::{Span, TextAttributes, TextOptions, TextOverflow, TextWrap};
 use blit_tui::widget::{scroll_list, Block, Text, Title};
 use blit_tui::{TuiContext, Ui};
 
-use crate::types::{DiveData, DiveLog, DiveMode, SafetyStop, Sample, Water};
+use crate::types::{logbook_numbers, DiveData, DiveLog, DiveMode, SafetyStop, Sample, Water};
 
 struct App {
     /// The file the dives come from, written back when one is ignored
     path: PathBuf,
     /// The dives, in the order of the file
     dives: Vec<DiveLog>,
+    /// Number of each dive in the logbook; none for an ignored dive
+    numbers: Vec<Option<u32>>,
     /// Indexes of the dives in the list, most recent first
     listed: Vec<usize>,
     /// Row of the list that is selected
@@ -40,6 +42,7 @@ impl App {
         let mut app = Self {
             path,
             dives,
+            numbers: Vec::new(),
             listed: Vec::new(),
             selected: 0,
             scroll: scroll_list::State::new(),
@@ -59,15 +62,19 @@ impl App {
         self.listed.get(self.selected).copied()
     }
 
-    /// Rebuild the list: most recent dive first, without the ignored ones
+    /// Rebuild the list: latest dive first, without the ignored ones
     /// unless they are asked for. `keep` is the dive to leave selected; when
     /// it is no longer listed, the selection stays on its row.
     fn list_dives(&mut self, keep: Option<usize>) {
+        self.numbers = logbook_numbers(&self.dives);
         self.listed = (0..self.dives.len())
             .filter(|&dive| self.show_ignored || !self.dives[dive].ignored)
             .collect();
-        self.listed
-            .sort_by_key(|&dive| std::cmp::Reverse(self.dives[dive].number));
+        // By date, as the dives are numbered
+        self.listed.sort_by_key(|&dive| {
+            let dive = &self.dives[dive];
+            std::cmp::Reverse((dive.datetime, dive.number))
+        });
 
         let row = keep.and_then(|keep| self.listed.iter().position(|&dive| dive == keep));
         self.selected = row
@@ -185,6 +192,7 @@ impl App {
         );
 
         let selected = self.selected;
+        let numbers = &self.numbers;
         let mut clicked = None;
         panel
             .child()
@@ -194,16 +202,17 @@ impl App {
                 scroll_list::Config::new(1.0),
                 self.listed
                     .iter()
-                    .map(|&dive| &self.dives[dive])
+                    .map(|&dive| (dive, &self.dives[dive]))
                     .enumerate(),
-                |(_, dive)| WidgetId::new(("dive", dive.number)),
-                |mut ui: Ui<'_>, (index, dive)| {
+                |(_, (dive, _))| WidgetId::new(("dive", *dive)),
+                |mut ui: Ui<'_>, (index, (dive_index, dive))| {
                     if ui.interact(Sense::CLICK).clicked {
                         clicked = Some(index);
                     }
+                    // An ignored dive is not counted
+                    let number = numbers[dive_index].map_or(String::new(), |n| format!("#{n}"));
                     let line = format!(
-                        " #{:<3} {} {:5.1}m {:3}min {}",
-                        dive.number,
+                        " {number:<4} {} {:5.1}m {:3}min {}",
                         dive.datetime.format("%Y-%m-%d"),
                         dive.max_depth_m,
                         dive.duration_seconds / 60,
@@ -260,7 +269,7 @@ impl App {
         column
             .child()
             .item(flex::item().width(Sizing::grow()).height(Sizing::fit()))
-            .build(|ui: Ui<'_>| render_dive_info(ui, dive));
+            .build(|ui: Ui<'_>| render_dive_info(ui, dive, self.numbers[index]));
         column
             .child()
             .item(flex::item().grow())
@@ -516,7 +525,8 @@ fn panel_block(title: &str) -> Block<'_> {
         .title(Title::new(title))
 }
 
-fn render_dive_info(ui: Ui<'_>, dive: &DiveLog) {
+/// `number` is that of the dive in the logbook.
+fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) {
     let duration_min = dive.duration_seconds / 60;
     let duration_sec = dive.duration_seconds % 60;
 
@@ -587,11 +597,13 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog) {
         depth,
     ];
 
-    let mut right_col: Vec<String> = vec![if dive.dips.is_empty() {
-        format!(" Gas:       {}", gas_str)
-    } else {
-        format!(" Dips:      {}", dive.dips.len())
-    }];
+    // A dive from a logbook has no gas to name
+    let mut right_col: Vec<String> = Vec::new();
+    if !dive.dips.is_empty() {
+        right_col.push(format!(" Dips:      {}", dive.dips.len()));
+    } else if !gas_str.is_empty() {
+        right_col.push(format!(" Gas:       {}", gas_str));
+    }
 
     if temp_min != f64::MAX {
         right_col.push(format!(" Temp:      {:.1} - {:.1} C", temp_min, temp_max));
@@ -658,7 +670,15 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog) {
     panel.insert(panel_block(" Dive Details "));
 
     // Title line
-    let number = format!("  Dive #{}  ", dive.number);
+    let number = match number {
+        Some(number) => format!("  Dive #{number}  "),
+        None => "  Dive  ".to_string(),
+    };
+    // The number the dive has on the watch, to find it there
+    let on_watch = match dive.number {
+        0 => String::new(),
+        number => format!("    watch #{number}"),
+    };
     let mode = format!("{:?}", dive.dive_mode);
     let count = if dive.dips.is_empty() {
         format!("    ({} samples)", dive.samples.len())
@@ -671,6 +691,7 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog) {
             .attributes(TextAttributes::BOLD),
         Span::new(&mode).color(Color::YELLOW),
         Span::new(&count),
+        Span::new(&on_watch).color(Color::DARK_GRAY),
         Span::new(if dive.ignored { "    ignored" } else { "" }).color(Color::MAGENTA),
     ]));
 
@@ -1160,28 +1181,31 @@ mod tests {
     }
 
     #[test]
-    fn ignored_dives_are_listed_only_on_request() {
+    fn ignored_dives_are_listed_only_on_request_and_not_counted() {
         let mut dives = three_dives();
         dives[1].ignored = true;
         let mut app = App::new(PathBuf::new(), dives);
 
+        // Two dives left, numbered 2 and 1 whatever the watch calls them
         let hidden = screen(&mut app, 120, 36);
-        assert!(row_of(&hidden, "#3 ") < row_of(&hidden, "#1 "));
-        assert!(!hidden.contains("#2 "));
+        assert_eq!(row_of(&hidden, " #2 "), row_of(&hidden, " #1 ") - 1);
+        assert!(!hidden.lines().any(|line| line.starts_with("│ #3")));
+        row_of(&hidden, "Dive #2  Air    (3 samples)    watch #3");
         row_of(&hidden, "i ignore  a show 1 ignored");
 
+        // Listed again, the ignored dive sits between them without a number
         app.handle_input(Input::Text('a'));
         let all = screen(&mut app, 120, 36);
-        assert_eq!(row_of(&all, "#2 "), row_of(&all, "#3 ") + 1);
+        assert_eq!(row_of(&all, " #2 "), row_of(&all, " #1 ") - 2);
         row_of(&all, "i ignore  a hide ignored");
-        // The selection stayed on the most recent dive
-        row_of(&all, "Dive #3");
+        // The selection stayed where it was
+        row_of(&all, "Dive #2  Air");
 
         // The ignored dive says so when it is the one shown
         app.handle_input(Input::Text('j'));
         row_of(
             &screen(&mut app, 120, 36),
-            "Dive #2  Air    (3 samples)    ignored",
+            "Dive  Air    (3 samples)    watch #2    ignored",
         );
     }
 
@@ -1245,5 +1269,34 @@ mod tests {
             &screen(&mut app, 120, 36),
             "Every dive is ignored: press a to list them",
         );
+    }
+
+    #[test]
+    fn dive_from_the_logbook_takes_its_place_by_date() {
+        let mut dives = three_dives();
+        // Imported from the SSI logbook: a day after the others, and first
+        // in the file
+        dives.insert(
+            0,
+            DiveLog {
+                datetime: plain_dive().datetime + chrono::Duration::days(1),
+                duration_seconds: 4020,
+                max_depth_m: 36.0,
+                site: Some("Ras il-Hobz".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut app = App::new(PathBuf::new(), dives);
+
+        let text = screen(&mut app, 120, 36);
+        // First of the list and fourth dive of the logbook, as the latest
+        let row = row_of(&text, "#4   2025-08-02  36.0m  67min");
+        assert_eq!(row + 1, row_of(&text, "#3 "));
+        // The watch has no number for it
+        row_of(&text, "Dive #4  Air    (0 samples)");
+        assert!(!text.contains("watch #0"));
+        row_of(&text, "Site:      Ras il-Hobz");
+        row_of(&text, "No sample data");
+        assert!(!text.contains("Gas:"));
     }
 }

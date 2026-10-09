@@ -300,12 +300,14 @@ fn resample(samples: &[Sample], interval: u32) -> Vec<Point> {
 
 /// Encode a dive as a FIT activity file.
 ///
-/// `start` is the start of the dive in UTC and `utc_offset` what to add to
+/// `number` is that of the dive in the logbook, which is not the one the
+/// dive computer gave it. `start` is the start of the dive in UTC and `utc_offset` what to add to
 /// UTC, in seconds, to get the local time of the dive. The profile is
 /// written as one record every `interval` seconds, as a Descent logs every
 /// second; an interval of 0 writes the samples as logged.
 pub fn encode_dive(
     dive: &DiveLog,
+    number: u32,
     start: NaiveDateTime,
     utc_offset: i32,
     interval: u32,
@@ -567,7 +569,7 @@ pub fn encode_dive(
         (26, Value::Uint16(1)), // num_laps
         (140, avg_depth),
         (141, max_depth),
-        (156, Value::Uint32(dive.number)), // dive_number
+        (156, Value::Uint32(number)), // dive_number
     ]);
     if !temperatures.is_empty() {
         let degrees = |t: f64| Value::Sint8(t.round() as i8);
@@ -609,7 +611,7 @@ pub fn encode_dive(
             (1, Value::Uint16(0)),         // reference_index
             (2, avg_depth),
             (3, max_depth),
-            (10, Value::Uint32(dive.number)),        // dive_number
+            (10, Value::Uint32(number)),             // dive_number
             (11, Value::Uint32(dive_time_s * 1000)), // bottom_time
         ];
         summary.extend(toxicity([4, 5, 6, 9]));
@@ -733,7 +735,7 @@ mod tests {
 
     #[test]
     fn file_has_a_header_and_valid_crcs() {
-        let file = encode_dive(&dive(), start(), 7200, 0).unwrap();
+        let file = encode_dive(&dive(), 7, start(), 7200, 0).unwrap();
         assert_eq!(file[0], 14);
         assert_eq!(&file[8..12], b".FIT");
         let data_size = u32::from_le_bytes(file[4..8].try_into().unwrap()) as usize;
@@ -746,7 +748,7 @@ mod tests {
     #[test]
     fn dive_is_written_as_a_diving_activity() {
         let begin = fit_time(start());
-        let messages = decode(&encode_dive(&dive(), start(), 7200, 0).unwrap());
+        let messages = decode(&encode_dive(&dive(), 7, start(), 7200, 0).unwrap());
 
         let order: Vec<u16> = messages.iter().map(|message| message.0).collect();
         assert_eq!(
@@ -798,7 +800,7 @@ mod tests {
     fn log_running_past_the_dive_time_sets_the_elapsed_time() {
         let mut dive = dive();
         dive.duration_seconds = 25;
-        let messages = decode(&encode_dive(&dive, start(), 0, 0).unwrap());
+        let messages = decode(&encode_dive(&dive, 7, start(), 0, 0).unwrap());
 
         let session = messages.iter().find(|message| message.0 == 18).unwrap();
         assert_eq!(field(session, 7), 30_000);
@@ -818,7 +820,7 @@ mod tests {
         assert_eq!(points[3].temp_c, Some(18.6));
         assert_eq!(points[4].temp_c, None);
 
-        let messages = decode(&encode_dive(&dive(), start(), 0, 1).unwrap());
+        let messages = decode(&encode_dive(&dive(), 7, start(), 0, 1).unwrap());
         assert_eq!(
             messages.iter().filter(|message| message.0 == 20).count(),
             21
@@ -831,7 +833,7 @@ mod tests {
         // The transmitter is picked up after the first sample
         dive.samples[1].pressure_bar = Some(200.0);
         dive.samples[2].pressure_bar = Some(180.5);
-        let messages = decode(&encode_dive(&dive, start(), 0, 5).unwrap());
+        let messages = decode(&encode_dive(&dive, 7, start(), 0, 5).unwrap());
 
         let updates: Vec<(u32, u32)> = messages
             .iter()
@@ -897,7 +899,7 @@ mod tests {
     #[test]
     fn summary_carries_the_figures_of_the_watch() {
         let begin = fit_time(start());
-        let messages = decode(&encode_dive(&full_dive(), start(), 0, 0).unwrap());
+        let messages = decode(&encode_dive(&full_dive(), 7, start(), 0, 0).unwrap());
         let find = |global: u16| messages.iter().find(|message| message.0 == global).unwrap();
 
         let session = find(18);
@@ -936,7 +938,7 @@ mod tests {
 
     #[test]
     fn records_carry_deco_and_gas_data() {
-        let messages = decode(&encode_dive(&full_dive(), start(), 0, 0).unwrap());
+        let messages = decode(&encode_dive(&full_dive(), 7, start(), 0, 0).unwrap());
         let records: Vec<&Message> = messages.iter().filter(|message| message.0 == 20).collect();
         let [bottom, deco, last] = records[..] else {
             panic!("expected 3 records, got {}", records.len());
@@ -971,7 +973,7 @@ mod tests {
     #[test]
     fn records_take_the_step_values_of_the_sample_before() {
         // At one record per 5 s: 15 s still falls under the sample of 10 s
-        let messages = decode(&encode_dive(&full_dive(), start(), 0, 5).unwrap());
+        let messages = decode(&encode_dive(&full_dive(), 7, start(), 0, 5).unwrap());
         let records: Vec<&Message> = messages.iter().filter(|message| message.0 == 20).collect();
         assert_eq!(records.len(), 5);
 
@@ -984,7 +986,7 @@ mod tests {
     #[test]
     fn alarms_and_gas_switches_become_events() {
         let begin = fit_time(start());
-        let messages = decode(&encode_dive(&full_dive(), start(), 0, 1).unwrap());
+        let messages = decode(&encode_dive(&full_dive(), 7, start(), 0, 1).unwrap());
 
         // Without the timer start and stop: (seconds, event, data)
         let data = |message: &Message| {
@@ -1025,7 +1027,7 @@ mod tests {
             he: 45,
             ..Default::default()
         };
-        let messages = decode(&encode_dive(&dive, start(), 0, 0).unwrap());
+        let messages = decode(&encode_dive(&dive, 7, start(), 0, 0).unwrap());
 
         let gas = messages.iter().find(|message| message.0 == 259).unwrap();
         assert_eq!((field(gas, 1), field(gas, 0)), (18, 45));
@@ -1048,6 +1050,6 @@ mod tests {
     fn dive_without_samples_is_refused() {
         let mut dive = dive();
         dive.samples.clear();
-        assert!(encode_dive(&dive, start(), 0, 1).is_err());
+        assert!(encode_dive(&dive, 7, start(), 0, 1).is_err());
     }
 }

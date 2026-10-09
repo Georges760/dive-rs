@@ -180,6 +180,8 @@ pub struct Dip {
 /// A parsed dive log entry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiveLog {
+    /// Number the dive computer gives the dive; 0 for a dive that comes
+    /// from a logbook only. Not the number shown: see `logbook_numbers`.
     pub number: u32,
     #[serde(with = "datetime_format")]
     pub datetime: NaiveDateTime,
@@ -248,6 +250,37 @@ pub struct DiveLog {
     pub ignored: bool,
 }
 
+impl DiveLog {
+    /// Whether the dive was imported from a logbook: no dive computer
+    /// handed it over, so it has no number of its own and no profile.
+    pub fn is_logbook_only(&self) -> bool {
+        self.number == 0
+    }
+}
+
+/// Number of each dive in the logbook, counted as the SSI logbook does: by
+/// date, scuba dives and freedive sessions each on their own. An ignored
+/// dive has none, and leaves no gap.
+pub fn logbook_numbers(dives: &[DiveLog]) -> Vec<Option<u32>> {
+    let mut by_date: Vec<usize> = (0..dives.len()).collect();
+    by_date.sort_by_key(|&dive| (dives[dive].datetime, dives[dive].number));
+
+    let mut numbers = vec![None; dives.len()];
+    let (mut scuba, mut freedives) = (0, 0);
+    for dive in by_date {
+        if dives[dive].ignored {
+            continue;
+        }
+        let count = match dives[dive].dive_mode {
+            DiveMode::Freedive => &mut freedives,
+            _ => &mut scuba,
+        };
+        *count += 1;
+        numbers[dive] = Some(*count);
+    }
+    numbers
+}
+
 /// Collection of all parsed dives.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DiveData {
@@ -287,6 +320,33 @@ mod datetime_format {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logbook_counts_by_date_without_the_ignored_dives() {
+        let dive = |day: u32, dive_mode: DiveMode, ignored: bool| DiveLog {
+            datetime: chrono::NaiveDate::from_ymd_opt(2026, 8, day)
+                .unwrap()
+                .and_hms_opt(10, 0, 0)
+                .unwrap(),
+            dive_mode,
+            ignored,
+            ..Default::default()
+        };
+        // Not in date order: the dive of the 1st, from a logbook, comes last
+        let dives = [
+            dive(2, DiveMode::Air, false),
+            dive(3, DiveMode::Freedive, false),
+            dive(4, DiveMode::Air, true),
+            dive(5, DiveMode::Nitrox, false),
+            dive(6, DiveMode::Freedive, false),
+            dive(1, DiveMode::Air, false),
+        ];
+        // Scuba dives 1 to 3, freedive sessions 1 and 2, nothing for the ignored
+        assert_eq!(
+            logbook_numbers(&dives),
+            [Some(2), Some(1), None, Some(3), Some(2), Some(1)]
+        );
+    }
 
     #[test]
     fn dives_saved_before_the_extra_fields_read_and_write_back_unchanged() {

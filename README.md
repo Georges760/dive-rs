@@ -69,6 +69,10 @@ sirius-dive correlate --ssi "my.DiveSSI.com - mydivelog.csv" --json dives.json
 
 Dives are matched by exact date and time (minute-level).
 
+An SSI entry with no dive at its minute is a dive the watch never handed over: it is imported as a dive of its own, with the date, duration, depth, site and buddy of the logbook, and no profile. An entry that overlaps a dive of the watch is taken for that dive under another start time and left out.
+
+The SSI export glues the buddies of a dive to one another. They are told apart from the rest of the logbook, where each shows on its own or next to others, and written with commas between them, the dive center last.
+
 ### Interactive viewer
 
 ```bash
@@ -76,6 +80,8 @@ sirius-dive view
 ```
 
 Navigate with `j`/`k` or arrow keys. Toggle overlays with `d` (depth), `t` (temperature), `p` (pressure). Quit with `q`.
+
+Dives are listed by date and numbered as the SSI logbook numbers them: in that order, scuba dives and freedive sessions each on their own, ignored dives not counted. The number a dive has on the watch shows next to its title. `fit` names dives by the same logbook number.
 
 Press `i` to ignore the selected dive, an accidental one for instance. It leaves the list but stays in `dives.json`, marked as ignored, so the next download does not bring it back. `a` lists the ignored dives again, and `i` on one of them takes it back. The `fit` and `correlate` commands leave ignored dives out.
 
