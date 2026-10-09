@@ -419,7 +419,7 @@ struct Profile {
 ///
 /// AIRS record (bytes 6 and 7 worked out from the logs):
 ///   4: pressure (u16 LE, 1/100 bar)
-///   6: remaining gas time (u8, minutes; 254 = none)
+///   6: remaining gas time (u8, minutes; 254 = no reading, 255 = no transmitter)
 ///   7: gas consumption (u8, l/min at surface pressure)
 fn parse_ecop_profile(profile: &[u8], sample_interval: u32) -> Profile {
     let mut samples = Vec::new();
@@ -522,9 +522,9 @@ fn parse_ecop_profile(profile: &[u8], sample_interval: u32) -> Profile {
                     last_pressure_bar = Some(pressure_raw as f64 / 100.0);
                 }
 
-                // Gas time 254: the watch has no reading to work from
+                // Gas time 254 or 255: the watch has no reading to work from
                 let gas_time = profile[offset + 6];
-                let known = gas_time != 254;
+                let known = gas_time < 254;
                 last_gas_time_min = known.then_some(gas_time as u32);
                 last_sac_l_min = known.then_some(profile[offset + 7] as u32);
 
@@ -797,6 +797,21 @@ mod tests {
         assert_eq!(dive.tissue_n2_mbar, [725.5; 16]);
         // No helium in any compartment: left out
         assert!(dive.tissue_he_mbar.is_empty());
+    }
+
+    #[test]
+    fn no_gas_time_without_a_transmitter() {
+        // What every AIRS record holds on a dive without a transmitter
+        let mut profile = vec![0, 0, 0, 2];
+        profile.extend(airs(0, 255, 0));
+        profile.extend(dprs(256, 3629, 254, 0, 17, 0, [0, 0], 0));
+        let dive = parse_dive_ecop(0, &header(), &profile).unwrap();
+
+        let sample = &dive.samples[0];
+        assert_eq!(
+            (sample.pressure_bar, sample.gas_time_min, sample.sac_l_min),
+            (None, None, None)
+        );
     }
 
     #[test]
