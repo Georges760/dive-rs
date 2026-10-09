@@ -63,7 +63,7 @@ Import dive site, country, and buddy information from an SSI dive log CSV export
 
 ```bash
 sirius-dive correlate
-sirius-dive correlate --csv "my.DiveSSI.com - mydivelog.csv" --json dives.json
+sirius-dive correlate --ssi "my.DiveSSI.com - mydivelog.csv" --json dives.json
 ```
 
 Dives are matched by exact date and time (minute-level).

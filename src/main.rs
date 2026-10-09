@@ -94,7 +94,7 @@ enum Commands {
     Correlate {
         /// Path to SSI dive log CSV export
         #[arg(short, long, default_value = "my.DiveSSI.com - mydivelog.csv")]
-        csv: PathBuf,
+        ssi: PathBuf,
 
         /// Path to dives.json to enrich
         #[arg(short, long, default_value = "dives.json")]
@@ -200,7 +200,7 @@ async fn main() -> Result<()> {
             save,
         } => cmd_sdo(address, objects, save).await,
         Commands::View { input } => tui::run(input),
-        Commands::Correlate { csv, json } => cmd_correlate(csv, json),
+        Commands::Correlate { ssi, json } => cmd_correlate(ssi, json),
         Commands::Watermark {
             video,
             json,
