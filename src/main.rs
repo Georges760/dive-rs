@@ -146,9 +146,10 @@ enum Commands {
         number: Option<u32>,
 
         /// Time zone the dive computer's clock was set to, as an offset from
-        /// UTC such as "+02:00". Defaults to the time zone of the country of
-        /// the dive on that day, or of this machine for a dive with no
-        /// country. FIT timestamps are in UTC.
+        /// UTC such as "+02:00". Defaults to the "utc_offset" of the dive in
+        /// the file if it has one, else to the time zone of its country on
+        /// that day, or of this machine for a dive with no country. FIT
+        /// timestamps are in UTC.
         #[arg(long, allow_hyphen_values = true)]
         utc_offset: Option<chrono::FixedOffset>,
 
@@ -1472,6 +1473,35 @@ fn country_time_zone(country: &str) -> Option<chrono_tz::Tz> {
     }
 }
 
+/// Time zone the clock of the dive computer is taken to be on for a dive,
+/// and a note on where it comes from. In order: the option of this run,
+/// the offset set for the dive in the file, the time of its country, the
+/// time of this machine.
+fn dive_time_zone(
+    dive: &DiveLog,
+    option: Option<chrono::FixedOffset>,
+) -> Result<(chrono::FixedOffset, String)> {
+    if let Some(zone) = option {
+        return Ok((zone, String::new()));
+    }
+    if let Some(text) = &dive.utc_offset {
+        let zone = text.parse().ok().with_context(|| {
+            format!("\"utc_offset\" is {text:?}: expected an offset like \"+03:00\"")
+        })?;
+        return Ok((zone, " (set in the file)".to_string()));
+    }
+    Ok(match &dive.country {
+        Some(country) => match country_time_zone(country) {
+            Some(zone) => (utc_offset_at(&zone, dive.datetime), format!(" ({country})")),
+            None => (
+                utc_offset_at(&chrono::Local, dive.datetime),
+                format!(" (no time zone known for {country})"),
+            ),
+        },
+        None => (utc_offset_at(&chrono::Local, dive.datetime), String::new()),
+    })
+}
+
 fn cmd_fit(
     json: PathBuf,
     output: PathBuf,
@@ -1512,20 +1542,8 @@ fn cmd_fit(
     std::fs::create_dir_all(&output)?;
     let mut exported = 0;
     for (dive, number) in dives {
-        // Unless told otherwise, the clock of the dive computer is taken to
-        // be on the time of the country of the dive, and failing that on the
-        // time of this machine
-        let country_zone = dive.country.as_deref().and_then(country_time_zone);
-        let zone = match (utc_offset, country_zone) {
-            (Some(zone), _) => zone,
-            (None, Some(country)) => utc_offset_at(&country, dive.datetime),
-            (None, None) => utc_offset_at(&chrono::Local, dive.datetime),
-        };
-        let zone_from = match (utc_offset, &dive.country, country_zone) {
-            (Some(_), ..) | (None, None, _) => String::new(),
-            (None, Some(country), Some(_)) => format!(" ({country})"),
-            (None, Some(country), None) => format!(" (no time zone known for {country})"),
-        };
+        let (zone, zone_from) = dive_time_zone(dive, utc_offset)
+            .with_context(|| format!("Dive #{number} of {}", dive.datetime.format("%Y-%m-%d")))?;
         let start = dive.datetime - zone + chrono::Duration::seconds(offset);
 
         let file = match fit::encode_dive(dive, number, start, zone.local_minus_utc(), interval) {
@@ -1804,6 +1822,34 @@ mod tests {
         assert_eq!(hours("Inde", (2023, 2, 24)), 5.5);
 
         assert!(country_time_zone("Atlantide").is_none());
+    }
+
+    #[test]
+    fn utc_offset_of_a_dive_can_be_set_in_the_file() {
+        let hours = |dive: &DiveLog, option: Option<&str>| {
+            let option = option.map(|offset| offset.parse().unwrap());
+            let (zone, from) = dive_time_zone(dive, option).unwrap();
+            (zone.local_minus_utc() as f64 / 3600.0, from)
+        };
+        let mut dive = DiveLog {
+            datetime: chrono::NaiveDate::from_ymd_opt(2026, 5, 23)
+                .unwrap()
+                .and_hms_opt(7, 46, 0)
+                .unwrap(),
+            country: Some("Egypte".to_string()),
+            ..Default::default()
+        };
+
+        // The country, until the file says otherwise
+        assert_eq!(hours(&dive, None), (3.0, " (Egypte)".to_string()));
+        dive.utc_offset = Some("+05:00".to_string());
+        assert_eq!(hours(&dive, None), (5.0, " (set in the file)".to_string()));
+        // The option of the run has the last word
+        assert_eq!(hours(&dive, Some("-01:30")), (-1.5, String::new()));
+
+        dive.utc_offset = Some("5".to_string());
+        let error = dive_time_zone(&dive, None).unwrap_err();
+        assert!(error.to_string().contains("expected an offset like"));
     }
 
     #[test]

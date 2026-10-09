@@ -242,6 +242,11 @@ pub struct DiveLog {
     pub site: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub country: Option<String>,
+    /// Time zone the FIT export takes the dive computer to be on for this
+    /// dive, as an offset from UTC such as "+03:00". Set by hand, to
+    /// overrule the time zone of the country.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub utc_offset: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub buddy: Option<String>,
     /// Set aside in the viewer. Kept in the file all the same: a dive that

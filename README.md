@@ -95,7 +95,7 @@ sirius-dive fit -d 2026-10-05                 # the dives of one day
 sirius-dive fit -n 143 --utc-offset +03:00 --offset 20
 ```
 
-FIT timestamps are in UTC, while the dive log is in the local time of the dive computer. Its clock is taken to be on the time of the country of the dive, as `correlate` fills it in (France, Malta, Egypt, Croatia, Spain and India are known so far), or on the time of this machine for a dive with no country. `--utc-offset` gives another time zone. `--offset` adds seconds to the start time, which the log only keeps to the minute.
+FIT timestamps are in UTC, while the dive log is in the local time of the dive computer. Its clock is taken to be on the time of the country of the dive, as `correlate` fills it in (France, Malta, Egypt, Croatia, Spain and India are known so far), or on the time of this machine for a dive with no country. `--utc-offset` gives another time zone for a run. To set one for a dive for good, add `"utc_offset": "+03:00"` to it in `dives.json`: it overrules the country. `--offset` adds seconds to the start time, which the log only keeps to the minute.
 
 The profile is interpolated to one record per second, as a Descent logs it; `--interval 0` writes the samples as logged. The files name a Garmin Descent Mk3i as their source.
 
