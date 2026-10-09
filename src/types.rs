@@ -242,6 +242,10 @@ pub struct DiveLog {
     pub country: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub buddy: Option<String>,
+    /// Set aside in the viewer. Kept in the file all the same: a dive that
+    /// is not there would come back with the next download.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub ignored: bool,
 }
 
 /// Collection of all parsed dives.

@@ -14,37 +14,110 @@ use blit_tui::{TuiContext, Ui};
 use crate::types::{DiveData, DiveLog, DiveMode, SafetyStop, Sample, Water};
 
 struct App {
+    /// The file the dives come from, written back when one is ignored
+    path: PathBuf,
+    /// The dives, in the order of the file
     dives: Vec<DiveLog>,
+    /// Indexes of the dives in the list, most recent first
+    listed: Vec<usize>,
+    /// Row of the list that is selected
     selected: usize,
     scroll: scroll_list::State,
     show_depth: bool,
     show_temp: bool,
     show_pressure: bool,
+    /// Whether the list has the ignored dives too
+    show_ignored: bool,
+    /// What went wrong when the file was last written
+    error: Option<String>,
     /// Sample picked on the chart, as (dive index, sample index). Set while
     /// the detail panel borrows the dive, hence the cell.
     cursor: StateCell<Option<(usize, usize)>>,
 }
 
 impl App {
-    fn new(dives: Vec<DiveLog>) -> Self {
-        Self {
+    fn new(path: PathBuf, dives: Vec<DiveLog>) -> Self {
+        let mut app = Self {
+            path,
             dives,
+            listed: Vec::new(),
             selected: 0,
             scroll: scroll_list::State::new(),
             show_depth: true,
             show_temp: true,
             show_pressure: true,
+            show_ignored: false,
+            error: None,
             cursor: StateCell::new(None),
+        };
+        app.list_dives(None);
+        app
+    }
+
+    /// Index of the selected dive, if the list has any.
+    fn current(&self) -> Option<usize> {
+        self.listed.get(self.selected).copied()
+    }
+
+    /// Rebuild the list: most recent dive first, without the ignored ones
+    /// unless they are asked for. `keep` is the dive to leave selected; when
+    /// it is no longer listed, the selection stays on its row.
+    fn list_dives(&mut self, keep: Option<usize>) {
+        self.listed = (0..self.dives.len())
+            .filter(|&dive| self.show_ignored || !self.dives[dive].ignored)
+            .collect();
+        self.listed
+            .sort_by_key(|&dive| std::cmp::Reverse(self.dives[dive].number));
+
+        let row = keep.and_then(|keep| self.listed.iter().position(|&dive| dive == keep));
+        self.selected = row
+            .unwrap_or(self.selected)
+            .min(self.listed.len().saturating_sub(1));
+        self.scroll_to_selected();
+    }
+
+    /// Ignore the selected dive, or take it back, and write the file.
+    fn toggle_ignored(&mut self) {
+        let Some(dive) = self.current() else {
+            return;
+        };
+        self.dives[dive].ignored = !self.dives[dive].ignored;
+        self.error = self.save().err().map(|error| format!("{error:#}"));
+        if self.error.is_some() {
+            // Not written: do not show what the file does not hold
+            self.dives[dive].ignored = !self.dives[dive].ignored;
         }
+        self.list_dives(Some(dive));
+    }
+
+    /// Write the dives back to the file they were read from.
+    fn save(&mut self) -> Result<()> {
+        let data = DiveData {
+            dives: std::mem::take(&mut self.dives),
+        };
+        let json = serde_json::to_string_pretty(&data);
+        self.dives = data.dives;
+
+        // Through a temporary file: an interrupted write must not cost the log
+        let mut temporary = self.path.clone().into_os_string();
+        temporary.push(".tmp");
+        std::fs::write(&temporary, json?)
+            .and_then(|()| std::fs::rename(&temporary, &self.path))
+            .with_context(|| format!("Failed to write {}", self.path.display()))
     }
 
     /// Apply one input event. Returns true when the user asked to quit.
     fn handle_input(&mut self, input: Input) -> bool {
-        let last = self.dives.len() - 1;
+        let last = self.listed.len().saturating_sub(1);
         let previous = self.selected;
 
         match input {
             Input::Text('q') => return true,
+            Input::Text('i') => self.toggle_ignored(),
+            Input::Text('a') => {
+                self.show_ignored = !self.show_ignored;
+                self.list_dives(self.current());
+            }
             Input::Text('d') => self.show_depth = !self.show_depth,
             Input::Text('t') => self.show_temp = !self.show_temp,
             Input::Text('p') => self.show_pressure = !self.show_pressure,
@@ -95,8 +168,21 @@ impl App {
     }
 
     fn render_dive_list(&mut self, ui: Ui<'_>) {
+        let ignored = self.dives.iter().filter(|dive| dive.ignored).count();
+        let hint = match (self.show_ignored, ignored) {
+            (true, _) => " i ignore  a hide ignored ".to_string(),
+            (false, 0) => " i ignore ".to_string(),
+            (false, count) => format!(" i ignore  a show {count} ignored "),
+        };
+
         let mut panel = ui.layout(flex::column().padding(Sides::all(1.0)));
-        panel.insert(panel_block(" Dive Log "));
+        panel.insert(
+            panel_block(" Dive Log ").title(
+                Title::new(&hint)
+                    .color(Color::DARK_GRAY)
+                    .position(TitlePosition::BottomRight),
+            ),
+        );
 
         let selected = self.selected;
         let mut clicked = None;
@@ -106,7 +192,10 @@ impl App {
             .build(scroll_list::new(
                 &mut self.scroll,
                 scroll_list::Config::new(1.0),
-                self.dives.iter().enumerate(),
+                self.listed
+                    .iter()
+                    .map(|&dive| &self.dives[dive])
+                    .enumerate(),
                 |(_, dive)| WidgetId::new(("dive", dive.number)),
                 |mut ui: Ui<'_>, (index, dive)| {
                     if ui.interact(Sense::CLICK).clicked {
@@ -127,6 +216,8 @@ impl App {
                                 .color(Color::BLACK)
                                 .attributes(TextAttributes::BOLD),
                         );
+                    } else if dive.ignored {
+                        ui.insert(Text::new(&line).color(Color::DARK_GRAY));
                     } else {
                         ui.insert(Text::new(&line));
                     }
@@ -137,13 +228,33 @@ impl App {
                 },
             ));
 
+        // Under the list, over as many lines as it takes
+        if let Some(error) = &self.error {
+            panel
+                .child()
+                .item(flex::item().width(Sizing::grow()).height(Sizing::fit()))
+                .insert(
+                    Text::new(error)
+                        .color(Color::RED)
+                        .options(TextOptions::new().wrap(TextWrap::Word)),
+                );
+        }
+
         if let Some(index) = clicked {
             self.selected = index;
         }
     }
 
     fn render_detail_panel(&self, ui: Ui<'_>) {
-        let dive = &self.dives[self.selected];
+        let Some(index) = self.current() else {
+            let mut panel = ui.layout(flex::column().padding(Sides::all(1.0)));
+            panel.insert(panel_block(" Dive Details "));
+            panel
+                .child()
+                .insert(Text::new(" Every dive is ignored: press a to list them"));
+            return;
+        };
+        let dive = &self.dives[index];
 
         let mut column = ui.layout(flex::column());
         column
@@ -153,10 +264,11 @@ impl App {
         column
             .child()
             .item(flex::item().grow())
-            .build(|ui: Ui<'_>| self.render_profile(ui, dive));
+            .build(|ui: Ui<'_>| self.render_profile(ui, index, dive));
     }
 
-    fn render_profile(&self, ui: Ui<'_>, dive: &DiveLog) {
+    /// `index` is that of `dive` among the dives, to tell whose sample is picked.
+    fn render_profile(&self, ui: Ui<'_>, index: usize, dive: &DiveLog) {
         if !dive.dips.is_empty() {
             render_dips_table(ui, dive);
             return;
@@ -204,13 +316,13 @@ impl App {
                         distance(a).total_cmp(&distance(b))
                     })
                     .map(|(index, _)| index);
-                if let Some(index) = nearest {
-                    self.cursor.set(Some((self.selected, index)));
+                if let Some(sample) = nearest {
+                    self.cursor.set(Some((index, sample)));
                 }
             }
         }
         let picked = match self.cursor.get() {
-            Some((dive_index, sample)) if dive_index == self.selected => dive.samples.get(sample),
+            Some((dive_index, sample)) if dive_index == index => dive.samples.get(sample),
             _ => None,
         };
 
@@ -380,11 +492,7 @@ pub fn run(input: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    // Sort dives by number descending (most recent first)
-    let mut dives = data.dives;
-    dives.sort_by(|a, b| b.number.cmp(&a.number));
-
-    let mut app = App::new(dives);
+    let mut app = App::new(input, data.dives);
 
     // blit owns the terminal: raw mode, alternate screen, keyboard and mouse.
     // It needs the kitty keyboard protocol (kitty, ghostty, ...).
@@ -563,6 +671,7 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog) {
             .attributes(TextAttributes::BOLD),
         Span::new(&mode).color(Color::YELLOW),
         Span::new(&count),
+        Span::new(if dive.ignored { "    ignored" } else { "" }).color(Color::MAGENTA),
     ]));
 
     // Two columns of fields, each taking half of the width
@@ -975,7 +1084,7 @@ mod tests {
 
     #[test]
     fn details_show_what_the_watch_logs_about_the_dive() {
-        let mut app = App::new(vec![full_dive()]);
+        let mut app = App::new(PathBuf::new(), vec![full_dive()]);
         let screen = screen(&mut app, 120, 36);
 
         for text in [
@@ -1000,7 +1109,7 @@ mod tests {
 
     #[test]
     fn readout_shows_what_the_watch_logs_at_the_picked_sample() {
-        let mut app = App::new(vec![full_dive()]);
+        let mut app = App::new(PathBuf::new(), vec![full_dive()]);
 
         app.cursor.set(Some((0, 1)));
         let bottom = screen(&mut app, 120, 36);
@@ -1028,7 +1137,7 @@ mod tests {
 
     #[test]
     fn dive_from_an_older_log_keeps_its_short_panel() {
-        let mut app = App::new(vec![plain_dive()]);
+        let mut app = App::new(PathBuf::new(), vec![plain_dive()]);
         app.cursor.set(Some((0, 1)));
         let screen = screen(&mut app, 120, 36);
 
@@ -1038,5 +1147,103 @@ mod tests {
         // and the chart right under the legend, with no readout rows between
         let legend = row_of(&screen, "00:05 (16:03:05)  25.6 m  - bar  25.4 C");
         assert!(screen.lines().nth(legend + 1).unwrap().contains(" 0m│"));
+    }
+
+    /// Three dives numbered 1 to 3, in the order of a file.
+    fn three_dives() -> Vec<DiveLog> {
+        (1..=3)
+            .map(|number| DiveLog {
+                number,
+                ..plain_dive()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ignored_dives_are_listed_only_on_request() {
+        let mut dives = three_dives();
+        dives[1].ignored = true;
+        let mut app = App::new(PathBuf::new(), dives);
+
+        let hidden = screen(&mut app, 120, 36);
+        assert!(row_of(&hidden, "#3 ") < row_of(&hidden, "#1 "));
+        assert!(!hidden.contains("#2 "));
+        row_of(&hidden, "i ignore  a show 1 ignored");
+
+        app.handle_input(Input::Text('a'));
+        let all = screen(&mut app, 120, 36);
+        assert_eq!(row_of(&all, "#2 "), row_of(&all, "#3 ") + 1);
+        row_of(&all, "i ignore  a hide ignored");
+        // The selection stayed on the most recent dive
+        row_of(&all, "Dive #3");
+
+        // The ignored dive says so when it is the one shown
+        app.handle_input(Input::Text('j'));
+        row_of(
+            &screen(&mut app, 120, 36),
+            "Dive #2  Air    (3 samples)    ignored",
+        );
+    }
+
+    #[test]
+    fn ignoring_a_dive_writes_it_to_the_file() {
+        let path = std::env::temp_dir().join(format!("sirius-dive-{}.json", std::process::id()));
+        let read = |path: &PathBuf| -> Vec<(u32, bool)> {
+            let data: DiveData =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            data.dives
+                .iter()
+                .map(|dive| (dive.number, dive.ignored))
+                .collect()
+        };
+        let mut app = App::new(path.clone(), three_dives());
+
+        // The list starts on the most recent dive: ignore it
+        app.handle_input(Input::Text('i'));
+        // The file keeps its order and every dive, the ignored one marked
+        assert_eq!(read(&path), [(1, false), (2, false), (3, true)]);
+        let text = screen(&mut app, 120, 36);
+        assert!(!text.contains("#3 "));
+        // and the next dive takes its place
+        row_of(&text, "Dive #2");
+
+        // Listed again, the dive can be taken back
+        app.handle_input(Input::Text('a'));
+        app.handle_input(Input::Text('k'));
+        app.handle_input(Input::Text('i'));
+        assert_eq!(read(&path), [(1, false), (2, false), (3, false)]);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn dive_stays_when_the_file_cannot_be_written() {
+        let path = PathBuf::from("/nonexistent/dives.json");
+        let mut app = App::new(path, three_dives());
+
+        app.handle_input(Input::Text('i'));
+        assert!(!app.dives[2].ignored);
+        let text = screen(&mut app, 120, 36);
+        row_of(&text, "#3 ");
+        // The reason shows under the list, on a few lines
+        let error = row_of(&text, "Failed to write");
+        assert!(error > row_of(&text, "#1 "));
+        row_of(&text, "(os error 2)");
+    }
+
+    #[test]
+    fn list_can_be_left_empty() {
+        let mut dives = three_dives();
+        dives.truncate(1);
+        dives[0].ignored = true;
+        let mut app = App::new(PathBuf::new(), dives);
+
+        // Moving about an empty list does nothing
+        app.handle_input(Input::Text('j'));
+        app.handle_input(Input::Text('i'));
+        row_of(
+            &screen(&mut app, 120, 36),
+            "Every dive is ignored: press a to list them",
+        );
     }
 }

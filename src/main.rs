@@ -901,7 +901,9 @@ fn cmd_correlate(csv_path: PathBuf, json_path: PathBuf) -> Result<()> {
     let mut matched = 0u32;
     let mut unmatched = 0u32;
 
-    for dive in &mut data.dives {
+    // Dives ignored in the viewer are not looked up
+    let ignored = data.dives.iter().filter(|dive| dive.ignored).count();
+    for dive in data.dives.iter_mut().filter(|dive| !dive.ignored) {
         let key = (
             dive.datetime.date().year(),
             dive.datetime.date().month(),
@@ -927,6 +929,9 @@ fn cmd_correlate(csv_path: PathBuf, json_path: PathBuf) -> Result<()> {
     }
 
     eprintln!("Matched: {}, Unmatched: {}", matched, unmatched);
+    if ignored > 0 {
+        eprintln!("Left out {ignored} ignored dive(s)");
+    }
 
     // Write back
     let json = serde_json::to_string_pretty(&data)?;
@@ -1294,12 +1299,16 @@ fn cmd_fit(
     let data: DiveData = serde_json::from_str(&contents)
         .with_context(|| format!("Failed to parse {}", json.display()))?;
 
-    let dives: Vec<&DiveLog> = data
+    // Dives ignored in the viewer are not exported, even when asked for
+    let (ignored, dives): (Vec<&DiveLog>, Vec<&DiveLog>) = data
         .dives
         .iter()
         .filter(|dive| date.is_none_or(|date| dive.datetime.date() == date))
         .filter(|dive| number.is_none_or(|number| dive.number == number))
-        .collect();
+        .partition(|dive| dive.ignored);
+    if !ignored.is_empty() {
+        eprintln!("Left out {} ignored dive(s)", ignored.len());
+    }
     if dives.is_empty() {
         anyhow::bail!("No matching dive in {}", json.display());
     }
@@ -1363,4 +1372,87 @@ async fn find_device(
     };
 
     Ok(dev.peripheral)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A folder of its own for the files of a test.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sirius-dive-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Two dives of the same morning, the first one ignored in the viewer.
+    fn write_dives(path: &std::path::Path) {
+        let dive = |number: u32, hour: u32, ignored: bool| DiveLog {
+            number,
+            datetime: chrono::NaiveDate::from_ymd_opt(2025, 10, 26)
+                .unwrap()
+                .and_hms_opt(hour, 21, 0)
+                .unwrap(),
+            samples: vec![Sample {
+                depth_m: 5.0,
+                ..Default::default()
+            }],
+            ignored,
+            ..Default::default()
+        };
+        let data = DiveData {
+            dives: vec![dive(47, 10, true), dive(48, 12, false)],
+        };
+        std::fs::write(path, serde_json::to_string_pretty(&data).unwrap()).unwrap();
+    }
+
+    fn read_dives(path: &std::path::Path) -> Vec<DiveLog> {
+        let data: DiveData = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        data.dives
+    }
+
+    #[test]
+    fn correlate_leaves_ignored_dives_alone() {
+        let dir = scratch("correlate");
+        let (json, ssi) = (dir.join("dives.json"), dir.join("ssi.csv"));
+        write_dives(&json);
+        std::fs::write(
+            &ssi,
+            concat!(
+                "\"plongée #\",\"Site de plongée\",\"Pays\",\"Date / Temps\",\"a\",\"b\",\"c\",\"d\",\"e\",",
+                "\"Equipier / Instructor / Center\"\n",
+                "\"99\",\"West coast\",\"Croatie\",\"26. Oct 2025 10:21\",\"\",\"\",\"\",\"\",\"\",\"Venus\"\n",
+                "\"100\",\"Red Rocks\",\"Croatie\",\"26. Oct 2025 12:21\",\"\",\"\",\"\",\"\",\"\",\"Venus\"\n",
+            ),
+        )
+        .unwrap();
+
+        cmd_correlate(ssi, json.clone()).unwrap();
+
+        let dives = read_dives(&json);
+        assert_eq!(
+            (dives[0].number, &dives[0].site, dives[0].ignored),
+            (47, &None, true)
+        );
+        assert_eq!(dives[1].site.as_deref(), Some("Red Rocks"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fit_leaves_ignored_dives_out() {
+        let dir = scratch("fit");
+        let (json, output) = (dir.join("dives.json"), dir.join("fit"));
+        write_dives(&json);
+
+        cmd_fit(json.clone(), output.clone(), None, None, None, 0, 1).unwrap();
+        let files: Vec<String> = std::fs::read_dir(&output)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files, ["2025-10-26_12h21_dive_048.fit"]);
+
+        // Asked for by number, the ignored dive is still left out
+        assert!(cmd_fit(json, output, None, Some(47), None, 0, 1).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

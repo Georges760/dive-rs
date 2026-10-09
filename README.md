@@ -77,6 +77,8 @@ sirius-dive view
 
 Navigate with `j`/`k` or arrow keys. Toggle overlays with `d` (depth), `t` (temperature), `p` (pressure). Quit with `q`.
 
+Press `i` to ignore the selected dive, an accidental one for instance. It leaves the list but stays in `dives.json`, marked as ignored, so the next download does not bring it back. `a` lists the ignored dives again, and `i` on one of them takes it back. The `fit` and `correlate` commands leave ignored dives out.
+
 ### Export to FIT
 
 Write each dive as a FIT activity file laid out like a dive from a Garmin Descent (sport `diving`, depth in the records, tank pressure as `tank_update` messages, a `dive_summary`). The Insta360 app can import such files for its stats dashboard. What else the watch logs goes in where FIT has a place for it: no-deco time, deco stops, ascent rate, gas time and consumption in the records; gradient factors and water type as `dive_settings`; CNS, OTU and surface interval in the summary; alarms and gas switches as events.
