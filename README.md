@@ -83,6 +83,8 @@ Navigate with `j`/`k` or arrow keys. Toggle overlays with `d` (depth), `t` (temp
 
 Dives are listed by date and numbered as the SSI logbook numbers them: in that order, scuba dives and freedive sessions each on their own, ignored dives not counted. The number a dive has on the watch shows next to its title. `fit` names dives by the same logbook number. In the list the number is yellow, or cyan for a freedive session.
 
+Press `s` for a page of statistics over the whole logbook: totals and records, dives per year and per month of the year with a colour per country, time under water, depths, and the air used per minute at the surface month after month. That last figure, also shown with each dive, is the gas gone from the tank over the dive time and the mean pressure; it needs a transmitter and is only as right as the tank size the watch was given.
+
 Press `i` to ignore the selected dive, an accidental one for instance. It leaves the list but stays in `dives.json`, marked as ignored, so the next download does not bring it back. `a` lists the ignored dives again, and `i` on one of them takes it back. The `fit` and `correlate` commands leave ignored dives out.
 
 ### Export to FIT

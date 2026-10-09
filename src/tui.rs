@@ -11,6 +11,7 @@ use blit_tui::text::{Span, TextAttributes, TextOptions, TextOverflow, TextWrap};
 use blit_tui::widget::{scroll_list, Block, Text, Title};
 use blit_tui::{TuiContext, Ui};
 
+use crate::stats::{sac_l_min, stats, Period, Stats};
 use crate::types::{logbook_numbers, DiveData, DiveLog, DiveMode, SafetyStop, Sample, Water};
 
 struct App {
@@ -32,6 +33,8 @@ struct App {
     show_ignored: bool,
     /// What went wrong when the file was last written
     error: Option<String>,
+    /// The figures of the statistics page, while it is the one shown
+    stats: Option<Stats>,
     /// Sample picked on the chart, as (dive index, sample index). Set while
     /// the detail panel borrows the dive, hence the cell.
     cursor: StateCell<Option<(usize, usize)>>,
@@ -51,6 +54,7 @@ impl App {
             show_pressure: true,
             show_ignored: false,
             error: None,
+            stats: None,
             cursor: StateCell::new(None),
         };
         app.list_dives(None);
@@ -115,11 +119,23 @@ impl App {
 
     /// Apply one input event. Returns true when the user asked to quit.
     fn handle_input(&mut self, input: Input) -> bool {
+        // On the statistics page the list is out of sight and of reach
+        if self.stats.is_some() {
+            match input {
+                Input::Text('q') => return true,
+                Input::Text('s') => self.stats = None,
+                Input::Key(key) if key.pressed && key.key == Key::Escape => self.stats = None,
+                _ => {}
+            }
+            return false;
+        }
+
         let last = self.listed.len().saturating_sub(1);
         let previous = self.selected;
 
         match input {
             Input::Text('q') => return true,
+            Input::Text('s') => self.stats = Some(stats(&self.dives)),
             Input::Text('i') => self.toggle_ignored(),
             Input::Text('a') => {
                 self.show_ignored = !self.show_ignored;
@@ -162,6 +178,11 @@ impl App {
         let input = *ui.input();
         if self.handle_input(input) {
             ui.context().quit();
+            return;
+        }
+
+        if let Some(stats) = &self.stats {
+            render_stats(ui, stats);
             return;
         }
 
@@ -291,7 +312,7 @@ impl App {
         let mut panel = ui.layout(flex::column().padding(Sides::all(1.0)));
         panel.insert(
             panel_block(" Depth Profile ").title(
-                Title::new(" d depth  t temp  p pressure  q quit ")
+                Title::new(" d depth  t temp  p pressure  s stats  q quit ")
                     .color(Color::DARK_GRAY)
                     .position(TitlePosition::BottomRight),
             ),
@@ -662,6 +683,9 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) {
     if !tank_sizes.is_empty() {
         right_col.push(format!(" Tank:      {tank_sizes}"));
     }
+    if let Some(sac) = sac_l_min(dive) {
+        right_col.push(format!(" Air:       {sac:.1} l/min at the surface"));
+    }
     if !dive.gradient_factors.is_empty() {
         let sets: Vec<String> = dive
             .gradient_factors
@@ -870,6 +894,258 @@ fn render_dips_table(ui: Ui<'_>, dive: &DiveLog) {
             temp,
         )));
         start_s += dip.duration_s;
+    }
+}
+
+/// Colours of the countries on the statistics page, the most dived first.
+const COUNTRY_COLORS: [Color; 8] = [
+    Color::YELLOW,
+    Color::CYAN,
+    Color::GREEN,
+    Color::MAGENTA,
+    Color::LIGHT_RED,
+    Color::BLUE,
+    Color::LIGHT_GREEN,
+    Color::LIGHT_BLUE,
+];
+
+/// Colour of the dives of a country, by its rank in `Stats::countries`;
+/// the dives with no country, under the empty name, are grey.
+fn country_color(stats: &Stats, country: usize) -> Color {
+    match stats.countries[country].0.as_str() {
+        "" => Color::DARK_GRAY,
+        _ => COUNTRY_COLORS[country % COUNTRY_COLORS.len()],
+    }
+}
+
+fn hours(seconds: u64) -> String {
+    format!("{:.0} h", seconds as f64 / 3600.0)
+}
+
+/// The whole logbook in figures: totals, dives per year and per month of
+/// the year with a colour per country, air consumption month after month.
+fn render_stats(ui: Ui<'_>, stats: &Stats) {
+    let fit = || flex::item().width(Sizing::grow()).height(Sizing::fit());
+    let mut page = ui.layout(flex::column());
+
+    // Totals, records and the colours of the countries
+    {
+        let mut panel = page
+            .child()
+            .item(fit())
+            .layout(flex::column().padding(Sides::all(1.0)));
+        panel.insert(
+            panel_block(" Statistics ").title(
+                Title::new(" s dive log  q quit ")
+                    .color(Color::DARK_GRAY)
+                    .position(TitlePosition::BottomRight),
+            ),
+        );
+
+        let named = stats.countries.iter().filter(|(name, _)| !name.is_empty());
+        panel.child().insert(Text::new(&format!(
+            " {} dives, {} freedive sessions, {} under water, {} sites, {} countries",
+            stats.dives,
+            stats.freedive_sessions,
+            hours(stats.time_s),
+            stats.sites.len(),
+            named.count(),
+        )));
+
+        let place = |site: &String| match site.as_str() {
+            "" => String::new(),
+            site => format!(", {site}"),
+        };
+        let mut records = Vec::new();
+        if let Some((depth, date, site)) = &stats.deepest {
+            records.push(format!("Deepest {depth:.1} m ({date}{})", place(site)));
+        }
+        if let Some((seconds, date, site)) = &stats.longest {
+            records.push(format!(
+                "Longest {} min ({date}{})",
+                seconds / 60,
+                place(site)
+            ));
+        }
+        panel
+            .child()
+            .insert(Text::new(&format!(" {}", records.join("   "))));
+        let sites: Vec<String> = stats
+            .sites
+            .iter()
+            .take(4)
+            .map(|(site, dives)| format!("{site} ({dives})"))
+            .collect();
+        panel
+            .child()
+            .insert(Text::new(&format!(" Most dived: {}", sites.join(", "))));
+
+        let legend: Vec<(String, Color)> = stats
+            .countries
+            .iter()
+            .enumerate()
+            .map(|(index, (name, dives))| {
+                let name = if name.is_empty() { "no country" } else { name };
+                (format!(" ■ {name} {dives} "), country_color(stats, index))
+            })
+            .collect();
+        let spans: Vec<Span<'_>> = legend
+            .iter()
+            .map(|(text, color)| Span::new(text).color(*color))
+            .collect();
+        panel.child().insert(Text::rich(&spans));
+    }
+
+    // A bar cut in stretches, one per country
+    let by_country = |period: &Period| -> Vec<(f32, Color)> {
+        period
+            .by_country
+            .iter()
+            .enumerate()
+            .map(|(country, &dives)| (dives as f32, country_color(stats, country)))
+            .collect()
+    };
+    let chart = |ui: Ui<'_>, title: &str, rows: Vec<BarRow>| {
+        let mut panel = ui.layout(flex::column().padding(Sides::all(1.0)));
+        panel.insert(panel_block(title));
+        panel.child().item(fit()).insert(BarChart { rows });
+    };
+
+    let years = stats
+        .years
+        .iter()
+        .map(|year| BarRow {
+            label: year.label.clone(),
+            parts: by_country(year),
+            text: format!(
+                "{} dives  {}  depth avg {:.1} m, max {:.1} m",
+                year.dives,
+                hours(year.time_s),
+                year.avg_depth_m(),
+                year.max_depth_m,
+            ),
+        })
+        .collect();
+    page.child()
+        .item(fit())
+        .build(|ui: Ui<'_>| chart(ui, " Per year ", years));
+
+    let mut columns = page.child().item(fit()).layout(flex::row());
+    let months = stats
+        .months
+        .iter()
+        .map(|month| BarRow {
+            label: month.label.clone(),
+            parts: by_country(month),
+            text: match month.dives {
+                0 => String::new(),
+                dives => format!("{dives} dives  {}", hours(month.time_s)),
+            },
+        })
+        .collect();
+    columns
+        .child()
+        .item(fit())
+        .build(|ui: Ui<'_>| chart(ui, " Per month of the year ", months));
+
+    // Mean of the dives of each month, a dive counting once whatever its length
+    let consumption = stats
+        .sac_months
+        .iter()
+        .map(|month| {
+            let sac = month.avg_sac_l_min().unwrap_or(0.0);
+            BarRow {
+                label: month.label.clone(),
+                parts: vec![(sac as f32, Color::GREEN)],
+                text: format!("{sac:.1} l/min  {} dives", month.sac_dives),
+            }
+        })
+        .collect();
+    columns.child().item(fit()).build(|ui: Ui<'_>| {
+        chart(
+            ui,
+            " Air used per minute at the surface, month by month ",
+            consumption,
+        )
+    });
+}
+
+/// One row of a [`BarChart`]: a label, a bar made of coloured stretches
+/// laid end to end, and figures after it.
+struct BarRow {
+    label: String,
+    parts: Vec<(f32, Color)>,
+    text: String,
+}
+
+/// Horizontal bars on one scale, a row each. blit has no such atom.
+struct BarChart {
+    rows: Vec<BarRow>,
+}
+
+impl Atom<TuiContext> for BarChart {
+    fn measure(&self, _: &mut TuiContext, constraints: Constraints) -> Size {
+        constraints.constrain(Size::new(0.0, self.rows.len() as f32))
+    }
+
+    fn paint(&self, context: &mut TuiContext, area: LogicalRect) {
+        let mut cells = context.cells(area);
+        let width = |text: &String| text.chars().count();
+        // A blank on each side of the labels
+        let labels = self
+            .rows
+            .iter()
+            .map(|row| width(&row.label))
+            .max()
+            .unwrap_or(0)
+            + 2;
+        let texts = self
+            .rows
+            .iter()
+            .map(|row| width(&row.text))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        // What the labels and the figures leave is for the longest bar
+        let room = cells.columns().saturating_sub(labels + texts) as f32;
+        let total = |row: &BarRow| row.parts.iter().map(|part| part.0).sum::<f32>();
+        let longest = self.rows.iter().map(total).fold(0.0, f32::max);
+
+        for (y, row) in self.rows.iter().enumerate().take(cells.rows()) {
+            cells.write(1, y, &row.label, CellStyle::new().foreground(Color::GRAY));
+
+            let (mut end, mut sum) = (0, 0.0);
+            for &(value, color) in &row.parts {
+                sum += value;
+                let reach = if longest > 0.0 {
+                    (sum / longest * room).round() as usize
+                } else {
+                    0
+                };
+                for x in end..reach {
+                    let bar = Cell::new('█').style(CellStyle::new().foreground(color));
+                    cells.set_cell(labels + x, y, bar);
+                }
+                end = end.max(reach);
+            }
+            // Too little for a cell at this scale, but not nothing
+            if end == 0 && sum > 0.0 && room >= 1.0 {
+                let color = row
+                    .parts
+                    .iter()
+                    .rev()
+                    .find(|part| part.0 > 0.0)
+                    .map(|part| part.1);
+                let style = CellStyle::new().foreground(color.unwrap_or(Color::Reset));
+                cells.set_cell(labels, y, Cell::new('▏').style(style));
+                end = 1;
+            }
+            cells.write(labels + end + 1, y, &row.text, CellStyle::new());
+        }
+    }
+
+    fn paint_bounds(&self, area: LogicalRect) -> LogicalRect {
+        area
     }
 }
 
@@ -1136,6 +1412,7 @@ mod tests {
             "Temp:      20.4 - 26.1 C",
             "Pressure:  209 -> 99 bar",
             "Tank:      12 l, 200 bar",
+            "Air:       8.7 l/min at the surface",
             "GF:        85/85, 95/95",
             "CNS:       0.2 -> 5.7 %",
             "OTU:       0.5 -> 14.6",
@@ -1335,5 +1612,60 @@ mod tests {
         assert!(output.contains("\x1b[33m #1   \x1b[39m2025-08-01  31.2m  49min Ai"));
         // The selected row keeps its own colours, number included
         assert!(output.contains("\x1b[0;1;30;46m #2   2025-08-01"));
+    }
+
+    #[test]
+    fn statistics_page_sums_up_the_logbook() {
+        // Three dives in August 2025, two in Malta and one in France, and a
+        // fourth in Malta a year later
+        let mut dives = three_dives();
+        for (dive, country) in dives.iter_mut().zip(["Malte", "Malte", "France"]) {
+            dive.country = Some(country.to_string());
+        }
+        dives.push(DiveLog {
+            number: 4,
+            datetime: plain_dive().datetime + chrono::Duration::days(365),
+            country: Some("Malte".to_string()),
+            max_depth_m: 20.0,
+            ..plain_dive()
+        });
+        let mut app = App::new(PathBuf::new(), dives);
+
+        app.handle_input(Input::Text('s'));
+        let text = screen(&mut app, 120, 36);
+        row_of(
+            &text,
+            "4 dives, 0 freedive sessions, 3 h under water, 1 sites, 2 countries",
+        );
+        row_of(&text, "Deepest 31.2 m (2025-08-01, Blue Hole)");
+        row_of(&text, "■ Malte 3  ■ France 1");
+        row_of(&text, "3 dives  2 h  depth avg 31.2 m, max 31.2 m");
+        row_of(&text, "1 dives  1 h  depth avg 20.0 m, max 20.0 m");
+        row_of(&text, "Aug ");
+
+        // One scale for the bars of a panel: 2025 has three times the dives of 2026
+        let bar = |label: &str| {
+            let row = text.lines().find(|line| line.contains(label)).unwrap();
+            row.matches('█').count()
+        };
+        assert!(bar(" 2026 ") > 10);
+        assert!((bar(" 2025 ") as f64 / bar(" 2026 ") as f64 - 3.0).abs() < 0.2);
+        // All four dives are in August
+        assert!(bar(" Aug ") > 10);
+        assert_eq!(bar(" Jul "), 0);
+
+        // The colours of the countries, in the bar of 2025: Malta then France
+        let context = render(&mut app, 120, 36);
+        let output = String::from_utf8_lossy(context.renderer().output());
+        let bar = output.split("2025\x1b[39m ").nth(1).unwrap();
+        assert!(bar.starts_with("\x1b[33m█"));
+        assert!(bar.find("\x1b[36m█").unwrap() < bar.find("3 dives").unwrap());
+
+        // The same key leads back to the log
+        assert!(!app.handle_input(Input::Text('s')));
+        row_of(&screen(&mut app, 120, 36), "Dive Log");
+        // and q quits from the statistics too
+        app.handle_input(Input::Text('s'));
+        assert!(app.handle_input(Input::Text('q')));
     }
 }

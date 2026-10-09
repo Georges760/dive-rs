@@ -2,6 +2,7 @@ mod ble;
 mod fit;
 mod parser;
 mod protocol;
+mod stats;
 mod tui;
 mod types;
 
