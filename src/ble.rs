@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use btleplug::api::{
-    Central, CentralEvent, CharPropFlags, Characteristic, Manager as _, Peripheral as _, ScanFilter,
-    WriteType,
+    Central, CentralEvent, CharPropFlags, Characteristic, Manager as _, Peripheral as _,
+    ScanFilter, WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
@@ -12,10 +12,8 @@ use tokio::time;
 use uuid::Uuid;
 
 /// Known BLE UUIDs — confirmed matching the Sirius built-in BLE.
-pub const KNOWN_WRITE_UUID: Uuid =
-    Uuid::from_u128(0x99a91ebd_b21f_1689_bb43_681f1f55e966);
-pub const KNOWN_READ_UUID: Uuid =
-    Uuid::from_u128(0x1d1aae28_d2a8_91a1_1242_9d2973fbe571);
+pub const KNOWN_WRITE_UUID: Uuid = Uuid::from_u128(0x99a91ebd_b21f_1689_bb43_681f1f55e966);
+pub const KNOWN_READ_UUID: Uuid = Uuid::from_u128(0x1d1aae28_d2a8_91a1_1242_9d2973fbe571);
 
 /// BLE name prefixes that identify Mares dive computers.
 const MARES_NAME_PREFIXES: &[&str] = &[
@@ -71,15 +69,14 @@ pub struct BleConnection {
 
 /// Get the default BLE adapter.
 pub async fn get_adapter() -> Result<Adapter> {
-    let manager = Manager::new().await.context("Failed to create BLE manager")?;
+    let manager = Manager::new()
+        .await
+        .context("Failed to create BLE manager")?;
     let adapters = manager
         .adapters()
         .await
         .context("Failed to get BLE adapters")?;
-    adapters
-        .into_iter()
-        .next()
-        .context("No BLE adapters found")
+    adapters.into_iter().next().context("No BLE adapters found")
 }
 
 /// Scan for supported BLE dive computers.
@@ -236,9 +233,7 @@ pub async fn connect(
 
     let listener = tokio::spawn(async move {
         while let Some(notification) = stream.next().await {
-            if notification.uuid == read_uuid_filter
-                && tx.send(notification.value).await.is_err()
-            {
+            if notification.uuid == read_uuid_filter && tx.send(notification.value).await.is_err() {
                 break; // receiver dropped
             }
         }
@@ -288,11 +283,7 @@ impl BleConnection {
     }
 
     /// Receive notification data, accumulating until we have at least `min_bytes` or timeout.
-    pub async fn recv_accumulated(
-        &mut self,
-        min_bytes: usize,
-        timeout_ms: u64,
-    ) -> Result<Vec<u8>> {
+    pub async fn recv_accumulated(&mut self, min_bytes: usize, timeout_ms: u64) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         let deadline = time::Instant::now() + Duration::from_millis(timeout_ms);
 

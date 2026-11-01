@@ -92,25 +92,15 @@ async fn packet_variable_no_payload(conn: &mut BleConnection, cmd: u8) -> Result
 
 /// Send a command header, wait for ACK, send payload, collect response until END.
 /// Returns the full response (ACK + data + END) accumulated from notifications.
-async fn send_with_payload(
-    conn: &mut BleConnection,
-    cmd: u8,
-    payload: &[u8],
-) -> Result<Vec<u8>> {
+async fn send_with_payload(conn: &mut BleConnection, cmd: u8, payload: &[u8]) -> Result<Vec<u8>> {
     conn.drain();
     conn.write(&cmd_header(cmd)).await?;
 
     // Wait for ACK (first notification)
-    let ack = conn
-        .recv(TIMEOUT_MS)
-        .await
-        .context("No ACK after header")?;
+    let ack = conn.recv(TIMEOUT_MS).await.context("No ACK after header")?;
 
     if ack.is_empty() || ack[0] != ACK {
-        bail!(
-            "Expected ACK, got [{}]",
-            hex_dump(&ack)
-        );
+        bail!("Expected ACK, got [{}]", hex_dump(&ack));
     }
 
     // Send payload immediately after ACK
@@ -174,10 +164,7 @@ async fn recv_sdo_segment(conn: &mut BleConnection, expected_data_len: usize) ->
     }
 
     if response.is_empty() || response[0] != ACK {
-        bail!(
-            "SDO segment: expected ACK, got [{}]",
-            hex_dump(&response)
-        );
+        bail!("SDO segment: expected ACK, got [{}]", hex_dump(&response));
     }
 
     // Strip ACK and END, return data bytes (toggle + payload)
@@ -228,11 +215,7 @@ fn validate_response(data: &[u8]) -> Result<()> {
 
 /// Read an object from the device using the ECOP SDO protocol.
 /// Returns the data bytes for the requested object+sub-index.
-pub async fn ecop_read(
-    conn: &mut BleConnection,
-    index: u16,
-    sub_index: u8,
-) -> Result<Vec<u8>> {
+pub async fn ecop_read(conn: &mut BleConnection, index: u16, sub_index: u8) -> Result<Vec<u8>> {
     let index_lo = (index & 0xFF) as u8;
     let index_hi = ((index >> 8) & 0xFF) as u8;
 
@@ -334,10 +317,7 @@ pub async fn ecop_read(
             Ok(data)
         }
         _ => {
-            bail!(
-                "Unknown SDO status 0x{status:02X} [{}]",
-                hex_dump(ecop)
-            );
+            bail!("Unknown SDO status 0x{status:02X} [{}]", hex_dump(ecop));
         }
     }
 }

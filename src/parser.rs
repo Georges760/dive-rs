@@ -233,7 +233,11 @@ pub fn parse_dive_ecop(dive_index: u32, header: &[u8], profile: &[u8]) -> Result
     let profile = parse_ecop_profile(profile, sample_interval);
 
     Ok(DiveLog {
-        number: if dive_number > 0 { dive_number } else { dive_index + 1 },
+        number: if dive_number > 0 {
+            dive_number
+        } else {
+            dive_index + 1
+        },
         datetime,
         // The header of the first GENIUS firmware stops before this field
         end_datetime: (header.len() >= 0xC0)
@@ -305,7 +309,11 @@ fn parse_freedive_ecop(dive_index: u32, header: &[u8], data: &[u8]) -> Result<Di
     let max_depth_m = read_u16_le(header, 0x24) as f64 / 10.0;
 
     Ok(DiveLog {
-        number: if dive_number > 0 { dive_number } else { dive_index + 1 },
+        number: if dive_number > 0 {
+            dive_number
+        } else {
+            dive_index + 1
+        },
         datetime,
         duration_seconds,
         max_depth_m,
@@ -558,9 +566,7 @@ pub fn dive_to_csv(dive: &DiveLog) -> String {
             "{},{:.1},{},{}",
             s.time_s,
             s.depth_m,
-            s.temp_c
-                .map(|t| format!("{t:.1}"))
-                .unwrap_or_default(),
+            s.temp_c.map(|t| format!("{t:.1}")).unwrap_or_default(),
             s.pressure_bar
                 .map(|p| format!("{p:.1}"))
                 .unwrap_or_default(),

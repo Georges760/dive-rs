@@ -188,7 +188,11 @@ impl App {
 
         let mut root = ui.layout(flex::row());
         root.child()
-            .item(flex::item().width(Sizing::Percent(0.3)).height(Sizing::grow()))
+            .item(
+                flex::item()
+                    .width(Sizing::Percent(0.3))
+                    .height(Sizing::grow()),
+            )
             .build(|ui: Ui<'_>| self.render_dive_list(ui));
         root.child()
             .item(flex::item().grow())
@@ -258,7 +262,11 @@ impl App {
                     }
                 },
                 |active| {
-                    let thumb = if active { Color::CYAN } else { Color::DARK_GRAY };
+                    let thumb = if active {
+                        Color::CYAN
+                    } else {
+                        Color::DARK_GRAY
+                    };
                     (Some(Block::new()), Some(Block::new().background(thumb)))
                 },
             ));
@@ -337,11 +345,17 @@ impl App {
         // Pressing or dragging on the chart picks the sample under the pointer.
         // Done before the legend row is built so its readout is not a frame late.
         let chart_id = WidgetId::new("depth chart");
-        if panel.interact_widget(chart_id, Sense::CLICK_AND_DRAG).active {
-            if let (Some(area), Some(pointer)) = (panel.geometry(chart_id), panel.pointer_position()) {
+        if panel
+            .interact_widget(chart_id, Sense::CLICK_AND_DRAG)
+            .active
+        {
+            if let (Some(area), Some(pointer)) =
+                (panel.geometry(chart_id), panel.pointer_position())
+            {
                 let plot_x = area.x + LineChart::GUTTER as f32;
                 let plot_width = (area.width - LineChart::GUTTER as f32).max(1.0);
-                let time_s = ((pointer.x - plot_x) / plot_width).clamp(0.0, 1.0) * time_bound * 60.0;
+                let time_s =
+                    ((pointer.x - plot_x) / plot_width).clamp(0.0, 1.0) * time_bound * 60.0;
                 let nearest = dive
                     .samples
                     .iter()
@@ -372,7 +386,9 @@ impl App {
                 .samples
                 .iter()
                 .filter_map(value)
-                .fold((f64::MAX, f64::MIN), |(min, max), v| (min.min(v), max.max(v)));
+                .fold((f64::MAX, f64::MIN), |(min, max), v| {
+                    (min.min(v), max.max(v))
+                });
             let range = (max - min).max(1.0);
             let points: Vec<(f32, f32)> = dive
                 .samples
@@ -451,7 +467,10 @@ impl App {
                     Color::RED,
                 ),
             ],
-            None => vec![("click the chart to read values ".to_string(), Color::DARK_GRAY)],
+            None => vec![(
+                "click the chart to read values ".to_string(),
+                Color::DARK_GRAY,
+            )],
         };
         // Two spaces first, to stay clear of the legend
         let readout_spans: Vec<Span<'_>> = std::iter::once(Span::new("  "))
@@ -517,10 +536,10 @@ impl App {
 }
 
 pub fn run(input: PathBuf) -> Result<()> {
-    let contents =
-        std::fs::read_to_string(&input).with_context(|| format!("Failed to read {}", input.display()))?;
-    let data: DiveData =
-        serde_json::from_str(&contents).with_context(|| format!("Failed to parse {}", input.display()))?;
+    let contents = std::fs::read_to_string(&input)
+        .with_context(|| format!("Failed to read {}", input.display()))?;
+    let data: DiveData = serde_json::from_str(&contents)
+        .with_context(|| format!("Failed to parse {}", input.display()))?;
 
     if data.dives.is_empty() {
         eprintln!("No dives found in {}", input.display());
@@ -877,7 +896,8 @@ fn render_dips_table(ui: Ui<'_>, dive: &DiveLog) {
     panel.insert(panel_block(" Dips "));
 
     panel.child().insert(
-        Text::new("   #   Start   Depth    Time   Surface    Temp").attributes(TextAttributes::BOLD),
+        Text::new("   #   Start   Depth    Time   Surface    Temp")
+            .attributes(TextAttributes::BOLD),
     );
 
     // Start times are rebuilt by adding up surface and dive times
@@ -1207,8 +1227,18 @@ impl Atom<TuiContext> for LineChart {
         let middle = format!("{:.0}", self.x_max / 2.0);
         let end = format!("{:.0} min", self.x_max);
         cells.write(Self::GUTTER, height + 1, "0", axis);
-        cells.write(Self::GUTTER + (width - middle.len()) / 2, height + 1, &middle, axis);
-        cells.write(Self::GUTTER + width.saturating_sub(end.len()), height + 1, &end, axis);
+        cells.write(
+            Self::GUTTER + (width - middle.len()) / 2,
+            height + 1,
+            &middle,
+            axis,
+        );
+        cells.write(
+            Self::GUTTER + width.saturating_sub(end.len()),
+            height + 1,
+            &end,
+            axis,
+        );
 
         // Each cell is a 2x4 grid of braille dots; later series win the color
         let (dots_x, dots_y) = (width * 2, height * 4);

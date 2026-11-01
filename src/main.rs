@@ -255,10 +255,15 @@ enum OutputFormat {
 }
 
 fn parse_start_time(s: &str) -> Result<chrono::NaiveDateTime, String> {
-    ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"]
-        .iter()
-        .find_map(|format| chrono::NaiveDateTime::parse_from_str(s, format).ok())
-        .ok_or_else(|| "expected \"YYYY-MM-DD HH:MM[:SS]\"".to_string())
+    [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    ]
+    .iter()
+    .find_map(|format| chrono::NaiveDateTime::parse_from_str(s, format).ok())
+    .ok_or_else(|| "expected \"YYYY-MM-DD HH:MM[:SS]\"".to_string())
 }
 
 fn parse_u16(s: &str) -> Result<u16, std::num::ParseIntError> {
@@ -276,9 +281,7 @@ struct SdoSpec {
 }
 
 fn parse_sdo_spec(s: &str) -> Result<SdoSpec, String> {
-    let (index, subs) = s
-        .split_once(':')
-        .ok_or("expected INDEX:SUB[,SUB...]")?;
+    let (index, subs) = s.split_once(':').ok_or("expected INDEX:SUB[,SUB...]")?;
     let index = parse_u16(index).map_err(|e| e.to_string())?;
     let subs = subs
         .split(',')
@@ -476,7 +479,11 @@ async fn cmd_debug(address: Option<String>) -> Result<()> {
     match protocol::ecop_read(&mut conn, 0x2000, 4).await {
         Ok(data) => {
             let s = String::from_utf8_lossy(&data);
-            eprintln!("    Data ({} bytes): {:?}", data.len(), s.trim_end_matches('\0'));
+            eprintln!(
+                "    Data ({} bytes): {:?}",
+                data.len(),
+                s.trim_end_matches('\0')
+            );
             eprintln!("    Hex: [{}]", protocol::hex_dump(&data));
         }
         Err(e) => eprintln!("    Error: {e}"),
@@ -484,13 +491,21 @@ async fn cmd_debug(address: Option<String>) -> Result<()> {
 
     eprintln!("  Reading 0x2000 sub 8 (warranty)...");
     match protocol::ecop_read(&mut conn, 0x2000, 8).await {
-        Ok(data) => eprintln!("    Data ({} bytes): [{}]", data.len(), protocol::hex_dump(&data)),
+        Ok(data) => eprintln!(
+            "    Data ({} bytes): [{}]",
+            data.len(),
+            protocol::hex_dump(&data)
+        ),
         Err(e) => eprintln!("    Error: {e}"),
     }
 
     eprintln!("  Reading 0x2008 sub 1...");
     match protocol::ecop_read(&mut conn, 0x2008, 1).await {
-        Ok(data) => eprintln!("    Data ({} bytes): [{}]", data.len(), protocol::hex_dump(&data)),
+        Ok(data) => eprintln!(
+            "    Data ({} bytes): [{}]",
+            data.len(),
+            protocol::hex_dump(&data)
+        ),
         Err(e) => eprintln!("    Error: {e}"),
     }
 
@@ -524,25 +539,37 @@ async fn cmd_debug(address: Option<String>) -> Result<()> {
             eprintln!("  Header ({} bytes)", data.len());
             if data.len() >= 4 {
                 let obj_type = data[0];
-                eprintln!("  Object type: {} ({})", obj_type, match obj_type {
-                    1 => "SCUBA",
-                    2 => "FREEDIVE",
-                    3 => "GAUGE",
-                    _ => "unknown",
-                });
+                eprintln!(
+                    "  Object type: {} ({})",
+                    obj_type,
+                    match obj_type {
+                        1 => "SCUBA",
+                        2 => "FREEDIVE",
+                        3 => "GAUGE",
+                        _ => "unknown",
+                    }
+                );
             }
             if data.len() >= 12 {
                 // Bytes 4-7 should be a timestamp
                 let ts = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                 if let Some(dt) = chrono::DateTime::from_timestamp(ts as i64, 0) {
-                    eprintln!("  Timestamp: {} ({})", ts, dt.format("%Y-%m-%d %H:%M:%S UTC"));
+                    eprintln!(
+                        "  Timestamp: {} ({})",
+                        ts,
+                        dt.format("%Y-%m-%d %H:%M:%S UTC")
+                    );
                 } else {
                     eprintln!("  Timestamp raw: {}", ts);
                 }
             }
             // Print first 40 bytes hex
             let show = data.len().min(40);
-            eprintln!("  First {} bytes: [{}]", show, protocol::hex_dump(&data[..show]));
+            eprintln!(
+                "  First {} bytes: [{}]",
+                show,
+                protocol::hex_dump(&data[..show])
+            );
         }
         Err(e) => eprintln!("  Error: {e}"),
     }
@@ -553,15 +580,16 @@ async fn cmd_debug(address: Option<String>) -> Result<()> {
         Ok(data) => {
             eprintln!("  Profile ({} bytes)", data.len());
             let show = data.len().min(60);
-            eprintln!("  First {} bytes: [{}]", show, protocol::hex_dump(&data[..show]));
+            eprintln!(
+                "  First {} bytes: [{}]",
+                show,
+                protocol::hex_dump(&data[..show])
+            );
 
             // Look for record markers
             let markers = ["DSTR", "TISS", "DPRS", "AIRS"];
             for marker in &markers {
-                let count = data
-                    .windows(4)
-                    .filter(|w| *w == marker.as_bytes())
-                    .count();
+                let count = data.windows(4).filter(|w| *w == marker.as_bytes()).count();
                 if count > 0 {
                     eprintln!("  {} records: {}", marker, count);
                 }
@@ -603,7 +631,10 @@ async fn cmd_info(address: Option<String>) -> Result<()> {
     };
 
     println!("Device Info:");
-    println!("  Model:      {} (0x{:02X})", info.model_name, info.model as u8);
+    println!(
+        "  Model:      {} (0x{:02X})",
+        info.model_name, info.model as u8
+    );
     println!("  PCB Number: {}", pcb);
     println!("  Dives:      {}", dive_count);
 
@@ -770,14 +801,15 @@ async fn cmd_download(
             let data = DiveData { dives: all_dives };
             let json = serde_json::to_string_pretty(&data)?;
             std::fs::write(&output, &json)?;
-            eprintln!("Dive data saved to {} ({} dives)", output.display(), data.dives.len());
+            eprintln!(
+                "Dive data saved to {} ({} dives)",
+                output.display(),
+                data.dives.len()
+            );
         }
         OutputFormat::Csv => {
             for dive in &all_dives {
-                let stem = output
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy();
+                let stem = output.file_stem().unwrap_or_default().to_string_lossy();
                 let dir = output.parent().unwrap_or(std::path::Path::new("."));
                 let csv_path = dir.join(format!("{}_{:03}.csv", stem, dive.number));
                 let csv = parser::dive_to_csv(dive);
@@ -795,7 +827,10 @@ async fn cmd_download(
 fn cmd_parse(raw_dir: PathBuf, output: PathBuf, format: OutputFormat) -> Result<()> {
     // Count available dives
     let mut dive_count = 0u16;
-    while raw_dir.join(format!("dive_{:03}_header.bin", dive_count)).exists() {
+    while raw_dir
+        .join(format!("dive_{:03}_header.bin", dive_count))
+        .exists()
+    {
         dive_count += 1;
     }
 
@@ -803,7 +838,11 @@ fn cmd_parse(raw_dir: PathBuf, output: PathBuf, format: OutputFormat) -> Result<
         anyhow::bail!("No dive files found in {}", raw_dir.display());
     }
 
-    eprintln!("Found {} raw dive file(s) in {}", dive_count, raw_dir.display());
+    eprintln!(
+        "Found {} raw dive file(s) in {}",
+        dive_count,
+        raw_dir.display()
+    );
 
     let mut dives = Vec::new();
     for i in 0..dive_count {
@@ -849,10 +888,7 @@ fn cmd_parse(raw_dir: PathBuf, output: PathBuf, format: OutputFormat) -> Result<
         }
         OutputFormat::Csv => {
             for dive in &dives {
-                let stem = output
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy();
+                let stem = output.file_stem().unwrap_or_default().to_string_lossy();
                 let dir = output.parent().unwrap_or(std::path::Path::new("."));
                 let csv_path = dir.join(format!("{}_{:03}.csv", stem, dive.number));
                 let csv = parser::dive_to_csv(dive);
@@ -1020,21 +1056,20 @@ fn parse_ssi_csv(contents: &str) -> Vec<SsiRecord> {
             continue;
         }
 
-        let datetime = match chrono::NaiveDateTime::parse_from_str(
-            fields[date_col].trim(),
-            "%d. %b %Y %H:%M",
-        ) {
-            Ok(dt) => dt,
-            Err(e) => {
-                eprintln!(
-                    "Warning: skipping CSV line {} (bad date {:?}: {})",
-                    line_num + 2,
-                    fields[date_col],
-                    e
-                );
-                continue;
-            }
-        };
+        let datetime =
+            match chrono::NaiveDateTime::parse_from_str(fields[date_col].trim(), "%d. %b %Y %H:%M")
+            {
+                Ok(dt) => dt,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: skipping CSV line {} (bad date {:?}: {})",
+                        line_num + 2,
+                        fields[date_col],
+                        e
+                    );
+                    continue;
+                }
+            };
 
         // What only an imported dive needs; a freedive has no duration
         let field = |col: usize| fields.get(col).map_or("", |field| field.trim());
@@ -1079,7 +1114,11 @@ fn cmd_correlate(csv_path: PathBuf, json_path: PathBuf) -> Result<()> {
     let csv_contents = std::fs::read_to_string(&csv_path)
         .with_context(|| format!("Failed to read {}", csv_path.display()))?;
     let ssi_records = parse_ssi_csv(&csv_contents);
-    eprintln!("Parsed {} SSI record(s) from {}", ssi_records.len(), csv_path.display());
+    eprintln!(
+        "Parsed {} SSI record(s) from {}",
+        ssi_records.len(),
+        csv_path.display()
+    );
 
     // Build lookup by (year, month, day, hour, minute)
     let lookup: HashMap<(i32, u32, u32, u32, u32), &SsiRecord> = ssi_records
@@ -1205,7 +1244,14 @@ struct VideoMeta {
 
 fn probe_video(path: &std::path::Path, start: Option<chrono::NaiveDateTime>) -> Result<VideoMeta> {
     let output = std::process::Command::new("ffprobe")
-        .args(["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams"])
+        .args([
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+        ])
         .arg(path)
         .output()
         .context("Failed to run ffprobe. Is ffmpeg installed?")?;
@@ -1215,8 +1261,8 @@ fn probe_video(path: &std::path::Path, start: Option<chrono::NaiveDateTime>) -> 
         anyhow::bail!("ffprobe failed: {stderr}");
     }
 
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .context("Failed to parse ffprobe JSON output")?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("Failed to parse ffprobe JSON output")?;
 
     // Extract capture time from video metadata (try multiple tag formats),
     // unless the caller knows better
@@ -1249,7 +1295,9 @@ fn probe_video(path: &std::path::Path, start: Option<chrono::NaiveDateTime>) -> 
     };
 
     // Find video stream for resolution and duration
-    let streams = json["streams"].as_array().context("No streams in ffprobe output")?;
+    let streams = json["streams"]
+        .as_array()
+        .context("No streams in ffprobe output")?;
     let video_stream = streams
         .iter()
         .find(|s| s["codec_type"].as_str() == Some("video"))
@@ -1466,7 +1514,13 @@ fn cmd_watermark(
     let dive = find_overlapping_dive(&data.dives, meta.capture_time, meta.duration_secs, offset)?;
 
     // Build filter
-    let filter = build_drawtext_filter(dive, meta.capture_time, meta.duration_secs, offset, meta.height);
+    let filter = build_drawtext_filter(
+        dive,
+        meta.capture_time,
+        meta.duration_secs,
+        offset,
+        meta.height,
+    );
 
     // Build output path: YYYY-MM-DD_HHhMM_Site_Name.ext
     let ext = video.extension().unwrap_or_default().to_string_lossy();
@@ -1518,9 +1572,22 @@ fn cmd_watermark(
         cmd.args(["-vf", &filter]);
     }
 
-    cmd.args(["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-c:a", "copy",
-              "-map_metadata", "0", "-movflags", "+use_metadata_tags", "-y"])
-        .arg(&output_path);
+    cmd.args([
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "18",
+        "-c:a",
+        "copy",
+        "-map_metadata",
+        "0",
+        "-movflags",
+        "+use_metadata_tags",
+        "-y",
+    ])
+    .arg(&output_path);
 
     eprintln!("Running ffmpeg...");
     let status = cmd
@@ -1697,7 +1764,9 @@ async fn find_device(
         .collect();
 
     if devices.is_empty() {
-        anyhow::bail!("No {family} devices found. Make sure the dive computer is in Bluetooth mode.");
+        anyhow::bail!(
+            "No {family} devices found. Make sure the dive computer is in Bluetooth mode."
+        );
     }
 
     let dev = if let Some(addr) = address {
