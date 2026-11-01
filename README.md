@@ -1,6 +1,6 @@
-# sirius-dive
+# dive-rs
 
-Rust CLI tool that extracts dive logs from Mares Sirius dive computers via Bluetooth Low Energy (BLE). It reverse-engineers the proprietary ECOP protocol (CANopen SDO over BLE) used by Mares GENIUS-family devices.
+Rust CLI tool that extracts dive logs from dive computers via Bluetooth Low Energy (BLE). It currently supports the Mares GENIUS family, tested with the Sirius, and reverse-engineers the proprietary ECOP protocol (CANopen SDO over BLE) used by Mares GENIUS-family devices.
 
 ![TUI dive log viewer](screenshot.png)
 
@@ -29,7 +29,7 @@ Tested with the **Mares Sirius**.
 ## Build
 
 ```bash
-cd sirius-dive
+cd dive-rs
 cargo build --release
 ```
 
@@ -38,16 +38,16 @@ cargo build --release
 ### Scan for devices
 
 ```bash
-sirius-dive scan
-sirius-dive scan --enumerate   # also list GATT services
+dive-rs scan
+dive-rs scan --enumerate   # also list GATT services
 ```
 
 ### Download dive logs
 
 ```bash
-sirius-dive download                          # saves to dives.json
-sirius-dive download -o my_dives.json         # custom output path
-sirius-dive download --save-raw raw_data/     # also save raw binary data
+dive-rs download                          # saves to dives.json
+dive-rs download -o my_dives.json         # custom output path
+dive-rs download --save-raw raw_data/     # also save raw binary data
 ```
 
 Re-running `download` is incremental — only new dives are fetched.
@@ -55,7 +55,7 @@ Re-running `download` is incremental — only new dives are fetched.
 ### Parse raw data offline
 
 ```bash
-sirius-dive parse --raw-dir raw_data/
+dive-rs parse --raw-dir raw_data/
 ```
 
 ### Correlate with SSI export
@@ -63,8 +63,8 @@ sirius-dive parse --raw-dir raw_data/
 Import dive site, country, and buddy information from an SSI dive log CSV export:
 
 ```bash
-sirius-dive correlate
-sirius-dive correlate --ssi "my.DiveSSI.com - mydivelog.csv" --json dives.json
+dive-rs correlate
+dive-rs correlate --ssi "my.DiveSSI.com - mydivelog.csv" --json dives.json
 ```
 
 Dives are matched by exact date and time (minute-level).
@@ -76,7 +76,7 @@ The SSI export glues the buddies of a dive to one another. They are told apart f
 ### Interactive viewer
 
 ```bash
-sirius-dive view
+dive-rs view
 ```
 
 Navigate with `j`/`k` or arrow keys. Toggle overlays with `d` (depth), `t` (temperature), `p` (pressure). Quit with `q`.
@@ -92,9 +92,9 @@ Press `i` to ignore the selected dive, an accidental one for instance. It leaves
 Write each dive as a FIT activity file laid out like a dive from a Garmin Descent (sport `diving`, depth in the records, tank pressure as `tank_update` messages, a `dive_summary`). The Insta360 app can import such files for its stats dashboard. What else the watch logs goes in where FIT has a place for it: no-deco time, deco stops, ascent rate, gas time and consumption in the records; gradient factors and water type as `dive_settings`; CNS, OTU and surface interval in the summary; alarms and gas switches as events.
 
 ```bash
-sirius-dive fit                               # every dive of dives.json, into fit/
-sirius-dive fit -d 2026-10-05                 # the dives of one day
-sirius-dive fit -n 143 --utc-offset +03:00 --offset 20
+dive-rs fit                               # every dive of dives.json, into fit/
+dive-rs fit -d 2026-10-05                 # the dives of one day
+dive-rs fit -n 143 --utc-offset +03:00 --offset 20
 ```
 
 FIT timestamps are in UTC, while the dive log is in the local time of the dive computer. Its clock is taken to be on the time of the country of the dive, as `correlate` fills it in (France, Malta, Egypt, Croatia, Spain and India are known so far), or on the time of this machine for a dive with no country. `--utc-offset` gives another time zone for a run. To set one for a dive for good, add `"utc_offset": "+03:00"` to it in `dives.json`: it overrules the country. `--offset` adds seconds to the start time, which the log only keeps to the minute.

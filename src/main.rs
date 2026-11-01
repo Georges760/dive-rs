@@ -17,8 +17,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crate::types::*;
 
 #[derive(Parser)]
-#[command(name = "sirius-dive")]
-#[command(about = "Extract dive logs from Mares Sirius dive computer via BLE")]
+#[command(name = "dive-rs")]
+#[command(about = "Extract dive logs from dive computers via BLE")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -1406,7 +1406,7 @@ fn cmd_watermark(
     // Use filter_script if the filter string is very large (>100KB)
     let _tempfile;
     if filter.len() > 100 * 1024 {
-        let tmp = std::env::temp_dir().join("sirius_dive_filter.txt");
+        let tmp = std::env::temp_dir().join("dive_rs_filter.txt");
         std::fs::write(&tmp, &filter)?;
         cmd.args(["-filter_script:v"]).arg(&tmp);
         _tempfile = Some(tmp);
@@ -1607,7 +1607,7 @@ mod tests {
 
     /// A folder of its own for the files of a test.
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("sirius-dive-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dive-rs-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

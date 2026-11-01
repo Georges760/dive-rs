@@ -1507,7 +1507,7 @@ mod tests {
 
     #[test]
     fn ignoring_a_dive_writes_it_to_the_file() {
-        let path = std::env::temp_dir().join(format!("sirius-dive-{}.json", std::process::id()));
+        let path = std::env::temp_dir().join(format!("dive-rs-{}.json", std::process::id()));
         let read = |path: &PathBuf| -> Vec<(u32, bool)> {
             let data: DiveData =
                 serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();

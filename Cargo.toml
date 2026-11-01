@@ -1,8 +1,8 @@
 [package]
-name = "sirius-dive"
+name = "dive-rs"
 version = "0.1.0"
 edition = "2021"
-description = "Extract dive logs from Mares Sirius dive computer via BLE"
+description = "Extract dive logs from dive computers via BLE"
 
 [dependencies]
 anyhow = "1"
