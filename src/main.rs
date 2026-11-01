@@ -1,6 +1,7 @@
 mod ble;
 mod dsx;
 mod fit;
+mod merge;
 mod parser;
 mod protocol;
 mod stats;
@@ -27,7 +28,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Scan for Mares BLE devices and enumerate their GATT services
+    /// Scan for dive computers over BLE and enumerate their GATT services
     Scan {
         /// Scan duration in seconds
         #[arg(short, long, default_value = "10")]
@@ -38,55 +39,19 @@ enum Commands {
         enumerate: bool,
     },
 
-    /// Connect and query device info (model, serial, firmware)
-    Info {
-        /// BLE device address (e.g. "AA:BB:CC:DD:EE:FF"). If omitted, connects to first Mares device found.
-        #[arg(short, long)]
-        address: Option<String>,
+    /// Mares Sirius commands
+    Sirius {
+        #[command(subcommand)]
+        command: SiriusCommand,
     },
 
-    /// Download dive logs from the device
-    Download {
-        /// BLE device address. If omitted, connects to first Mares device found.
-        #[arg(short, long)]
-        address: Option<String>,
-
-        /// Output file path
-        #[arg(short, long, default_value = "dives.json")]
-        output: PathBuf,
-
-        /// Output format
-        #[arg(short, long, default_value = "json")]
-        format: OutputFormat,
-
-        /// Save raw dive data for debugging
-        #[arg(long)]
-        save_raw: Option<PathBuf>,
+    /// Commands for working on the protocols, not for everyday use
+    Advanced {
+        #[command(subcommand)]
+        command: AdvancedCommand,
     },
 
-    /// Raw protocol debug: test ECOP SDO communication
-    Debug {
-        /// BLE device address. If omitted, connects to first Mares device found.
-        #[arg(short, long)]
-        address: Option<String>,
-    },
-
-    /// Read raw SDO objects and hex-dump them (protocol exploration)
-    Sdo {
-        /// Objects to read in order, as INDEX:SUB[,SUB...], e.g. 0x3014:4,3 0x2008:1
-        #[arg(required = true, value_parser = parse_sdo_spec)]
-        objects: Vec<SdoSpec>,
-
-        /// BLE device address. If omitted, connects to first Mares device found.
-        #[arg(short, long)]
-        address: Option<String>,
-
-        /// Save each object to <DIR>/<index>_<sub>.bin and shorten the hex dump
-        #[arg(long)]
-        save: Option<PathBuf>,
-    },
-
-    /// Apeks DSX commands (experimental, not yet tested on a device)
+    /// Apeks DSX commands (experimental)
     Dsx {
         #[command(subcommand)]
         command: DsxCommand,
@@ -171,6 +136,31 @@ enum Commands {
         #[arg(long, default_value = "1")]
         interval: u32,
     },
+}
+
+#[derive(Subcommand)]
+enum AdvancedCommand {
+    /// Raw protocol debug: test ECOP SDO communication
+    Debug {
+        /// BLE device address. If omitted, connects to first Mares device found.
+        #[arg(short, long)]
+        address: Option<String>,
+    },
+
+    /// Read raw SDO objects and hex-dump them (protocol exploration)
+    Sdo {
+        /// Objects to read in order, as INDEX:SUB[,SUB...], e.g. 0x3014:4,3 0x2008:1
+        #[arg(required = true, value_parser = parse_sdo_spec)]
+        objects: Vec<SdoSpec>,
+
+        /// BLE device address. If omitted, connects to first Mares device found.
+        #[arg(short, long)]
+        address: Option<String>,
+
+        /// Save each object to <DIR>/<index>_<sub>.bin and shorten the hex dump
+        #[arg(long)]
+        save: Option<PathBuf>,
+    },
 
     /// Parse previously downloaded raw dive data (offline, no BLE needed)
     Parse {
@@ -185,6 +175,35 @@ enum Commands {
         /// Output format
         #[arg(short, long, default_value = "json")]
         format: OutputFormat,
+    },
+}
+
+#[derive(Subcommand)]
+enum SiriusCommand {
+    /// Connect and query device info (model, serial, firmware)
+    Info {
+        /// BLE device address (e.g. "AA:BB:CC:DD:EE:FF"). If omitted, connects to first Mares device found.
+        #[arg(short, long)]
+        address: Option<String>,
+    },
+
+    /// Download dive logs from the device
+    Download {
+        /// BLE device address. If omitted, connects to first Mares device found.
+        #[arg(short, long)]
+        address: Option<String>,
+
+        /// Output file path
+        #[arg(short, long, default_value = "dives.json")]
+        output: PathBuf,
+
+        /// Output format
+        #[arg(short, long, default_value = "json")]
+        format: OutputFormat,
+
+        /// Save raw dive data for debugging
+        #[arg(long)]
+        save_raw: Option<PathBuf>,
     },
 }
 
@@ -214,8 +233,8 @@ enum DsxCommand {
         #[arg(short, long)]
         address: Option<String>,
 
-        /// Output file path (kept apart from the Sirius log: dive numbers overlap)
-        #[arg(short, long, default_value = "dsx_dives.json")]
+        /// Output file path
+        #[arg(short, long, default_value = "dives.json")]
         output: PathBuf,
 
         /// Save the raw logbook entries and profiles for debugging
@@ -274,19 +293,28 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Scan { timeout, enumerate } => cmd_scan(timeout, enumerate).await,
-        Commands::Info { address } => cmd_info(address).await,
-        Commands::Download {
-            address,
-            output,
-            format,
-            save_raw,
-        } => cmd_download(address, output, format, save_raw).await,
-        Commands::Debug { address } => cmd_debug(address).await,
-        Commands::Sdo {
-            objects,
-            address,
-            save,
-        } => cmd_sdo(address, objects, save).await,
+        Commands::Sirius { command } => match command {
+            SiriusCommand::Info { address } => cmd_info(address).await,
+            SiriusCommand::Download {
+                address,
+                output,
+                format,
+                save_raw,
+            } => cmd_download(address, output, format, save_raw).await,
+        },
+        Commands::Advanced { command } => match command {
+            AdvancedCommand::Debug { address } => cmd_debug(address).await,
+            AdvancedCommand::Sdo {
+                objects,
+                address,
+                save,
+            } => cmd_sdo(address, objects, save).await,
+            AdvancedCommand::Parse {
+                raw_dir,
+                output,
+                format,
+            } => cmd_parse(raw_dir, output, format),
+        },
         Commands::Dsx { command } => cmd_dsx(command).await,
         Commands::View { input } => tui::run(input),
         Commands::Correlate { ssi, json } => cmd_correlate(ssi, json),
@@ -305,11 +333,6 @@ async fn main() -> Result<()> {
             offset,
             interval,
         } => cmd_fit(json, output, date, number, utc_offset, offset, interval),
-        Commands::Parse {
-            raw_dir,
-            output,
-            format,
-        } => cmd_parse(raw_dir, output, format),
     }
 }
 
@@ -604,8 +627,8 @@ async fn cmd_download(
         match std::fs::read_to_string(&output) {
             Ok(contents) => match serde_json::from_str::<DiveData>(&contents) {
                 Ok(data) => {
-                    // Dives from a logbook have no number of their own
-                    for dive in data.dives.iter().filter(|dive| !dive.is_logbook_only()) {
+                    // Dives the watch did not log have no number from it
+                    for dive in data.dives.iter().filter(|dive| dive.number > 0) {
                         existing_numbers.insert(dive.number);
                     }
                     eprintln!(
@@ -731,8 +754,10 @@ async fn cmd_download(
 
     // Merge existing + new dives
     let mut all_dives = existing_dives;
-    all_dives.append(&mut new_dives);
-    all_dives.sort_by_key(|d| (d.datetime, d.number));
+    let merged = merge::add_dives(&mut all_dives, new_dives);
+    if merged > 0 {
+        eprintln!("Merged {merged} into the entry another computer had for the same dive");
+    }
 
     if all_dives.is_empty() {
         eprintln!("No dives could be parsed.");

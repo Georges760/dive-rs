@@ -18,6 +18,8 @@ pub const PROFILE_END: u32 = 0x0200_0000;
 const HEADER_SIZE: usize = 256;
 const SAMPLE_SIZE: usize = 32;
 const FOOTER_SIZE: usize = 64;
+/// The no-deco time reads hundreds of minutes in shallow water: no limit
+const NO_LIMIT_NDL: u16 = 500;
 
 const FEET: f64 = 0.3048;
 const PSI: f64 = 0.068_947_572_9;
@@ -29,6 +31,17 @@ const MODE_SIDEMOUNT: u8 = 2;
 
 fn read_u16_le(data: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([data[offset], data[offset + 1]])
+}
+
+/// A GPS position, kept to about a metre; zeros when there was no fix.
+fn read_position(data: &[u8], offset: usize) -> Option<Position> {
+    let degrees = |at: usize| {
+        let value = f32::from_bits(read_u32_le(data, at)) as f64;
+        (value * 100_000.0).round() / 100_000.0
+    };
+    let (lat, lon) = (degrees(offset), degrees(offset + 4));
+    let valid = lat.abs() <= 90.0 && lon.abs() <= 180.0 && (lat != 0.0 || lon != 0.0);
+    valid.then_some(Position { lat, lon })
 }
 
 fn read_u32_le(data: &[u8], offset: usize) -> u32 {
@@ -140,7 +153,10 @@ pub fn serial_number(hw_cal: &[u8]) -> Option<u32> {
 ///   5: day                    6: month      7: year - 2000
 ///   8: profile start address (u32 LE)
 ///   12: profile end address (u32 LE)
+///   18: average depth (u16 LE, 1/10 ft)
 ///   45: dive mode (0 CC, 1 OC, 2 sidemount, 3 sidemount gauge, 4 gauge)
+///   240: start latitude, longitude (f32 LE, degrees; 0 without a fix)
+///   248: end latitude, longitude
 #[derive(Debug, Clone)]
 pub struct LogbookEntry {
     pub number: u32,
@@ -148,6 +164,9 @@ pub struct LogbookEntry {
     pub profile_begin: u32,
     pub profile_end: u32,
     pub mode: u8,
+    pub avg_depth_m: f64,
+    pub start_position: Option<Position>,
+    pub end_position: Option<Position>,
 }
 
 impl LogbookEntry {
@@ -180,6 +199,9 @@ impl LogbookEntry {
             profile_begin: read_u32_le(entry, 8),
             profile_end: read_u32_le(entry, 12),
             mode: entry[45],
+            avg_depth_m: read_u16_le(entry, 18) as f64 / 10.0 * FEET,
+            start_position: read_position(entry, 240),
+            end_position: read_position(entry, 248),
         }))
     }
 
@@ -281,6 +303,8 @@ pub fn parse_dive(entry: &LogbookEntry, profile: &[u8]) -> Result<DiveLog> {
 
         let temperature = read_u16_le(sample, 10);
         let pressure = read_u16_le(sample, 14);
+        let ndl = read_u16_le(sample, 4);
+        let stop = sample[8];
         let tank = sample[0] >> 4;
 
         samples.push(Sample {
@@ -288,6 +312,9 @@ pub fn parse_dive(entry: &LogbookEntry, profile: &[u8]) -> Result<DiveLog> {
             depth_m: read_u16_le(sample, 2) as f64 / 10.0 * FEET,
             temp_c: (temperature > 0).then(|| (temperature as f64 / 10.0 - 32.0) * 5.0 / 9.0),
             pressure_bar: (tank > 0 && pressure > 0).then_some(pressure as f64 * PSI),
+            ndl_min: (stop == 0 && ndl < NO_LIMIT_NDL).then_some(ndl as u32),
+            deco_time_min: (stop > 0).then_some(read_u16_le(sample, 6) as u32),
+            deco_stop_m: (stop > 0).then_some((stop as f64 * FEET).round() as u32),
             gas: gas_numbers
                 .iter()
                 .position(|&number| number == tank)
@@ -296,9 +323,24 @@ pub fn parse_dive(entry: &LogbookEntry, profile: &[u8]) -> Result<DiveLog> {
         });
     }
 
+    // The log goes on for minutes after the dive, out of the water
+    let temperatures = || {
+        samples
+            .iter()
+            .filter(|sample| sample.time_s <= duration_seconds)
+            .filter_map(|sample| sample.temp_c)
+    };
+    let min_temp_c = temperatures().reduce(f64::min);
+    let max_temp_c = temperatures().reduce(f64::max);
+
     Ok(DiveLog {
-        number: entry.number,
+        dsx_number: Some(entry.number),
         datetime: entry.datetime,
+        avg_depth_m: Some(entry.avg_depth_m),
+        min_temp_c,
+        max_temp_c,
+        start_position: entry.start_position,
+        end_position: entry.end_position,
         duration_seconds,
         max_depth_m,
         dive_mode,
@@ -369,7 +411,10 @@ mod tests {
         entry[3..8].copy_from_slice(&[14, 30, 5, 10, 26]); // 14:30, 5 Oct 2026
         entry[8..12].copy_from_slice(&begin.to_le_bytes());
         entry[12..16].copy_from_slice(&end.to_le_bytes());
+        entry[18..20].copy_from_slice(&328u16.to_le_bytes()); // 32.8 ft
         entry[45] = MODE_OC;
+        entry[240..244].copy_from_slice(&36.0175f32.to_le_bytes());
+        entry[244..248].copy_from_slice(&14.2528f32.to_le_bytes());
         entry
     }
 
@@ -379,6 +424,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(entry.number, 300);
+        assert!((entry.avg_depth_m - 9.997).abs() < 0.001);
+        let position = entry.start_position.unwrap();
+        assert_eq!((position.lat, position.lon), (36.0175, 14.2528));
+        assert_eq!(entry.end_position, None); // no fix
         assert_eq!(entry.datetime.to_string(), "2026-10-05 14:30:00");
         assert_eq!(entry.profile_ranges().unwrap()[0], (PROFILE_BEGIN, 400));
 
@@ -413,6 +462,7 @@ mod tests {
             sample[2..4].copy_from_slice(&depth.to_le_bytes());
             sample[10..12].copy_from_slice(&temperature.to_le_bytes());
             sample[14..16].copy_from_slice(&pressure.to_le_bytes());
+            sample[4..6].copy_from_slice(&(if slot == 0 { 598u16 } else { 66 }).to_le_bytes());
         }
         profile[HEADER_SIZE + SAMPLE_SIZE..][..SAMPLE_SIZE].fill(0xFF);
         let footer = profile.len() - FOOTER_SIZE;
@@ -431,6 +481,24 @@ mod tests {
         assert!((dive.samples[0].depth_m - 9.997).abs() < 0.001); // 32.8 ft
         assert!((dive.samples[0].temp_c.unwrap() - 20.0).abs() < 0.001); // 68.0 F
         assert!((dive.samples[0].pressure_bar.unwrap() - 199.95).abs() < 0.01); // 2900 psi
+        assert_eq!(
+            (dive.samples[0].ndl_min, dive.samples[1].ndl_min),
+            (None, Some(66))
+        );
+        assert!(dive.number == 0 && dive.dsx_number == Some(300));
+        assert_eq!(
+            (
+                dive.min_temp_c.map(f64::round),
+                dive.max_temp_c.map(f64::round)
+            ),
+            (Some(10.0), Some(20.0))
+        );
+
+        // A sample after the end of the dive is not the water temperature
+        profile[footer + 8..footer + 10].copy_from_slice(&15u16.to_le_bytes());
+        let dive = parse_dive(&entry, &profile).unwrap();
+        assert_eq!(dive.max_temp_c.map(f64::round), Some(20.0));
+        assert_eq!(dive.min_temp_c.map(f64::round), Some(20.0));
     }
 
     #[test]

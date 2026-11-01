@@ -1,14 +1,14 @@
 # dive-rs
 
-Rust CLI tool that extracts dive logs from dive computers via Bluetooth Low Energy (BLE). It currently supports the Mares GENIUS family, tested with the Sirius, and reverse-engineers the proprietary ECOP protocol (CANopen SDO over BLE) used by Mares GENIUS-family devices.
+Rust CLI tool that extracts dive logs from dive computers via Bluetooth Low Energy (BLE). It currently supports the Mares GENIUS family, tested with the Sirius, and experimentally the Apeks DSX. It reverse-engineers the proprietary ECOP protocol (CANopen SDO over BLE) used by Mares GENIUS-family devices.
 
 ![TUI dive log viewer](screenshot.png)
 
 ## Features
 
-- **Scan** for nearby Mares BLE devices
+- **Scan** for nearby dive computers over BLE
 - **Download** dive logs over BLE (incremental — skips already-downloaded dives)
-- **Parse** previously saved raw binary data offline
+- **Merge** a dive logged by two computers into one entry, with the best of both
 - **Correlate** with SSI dive log CSV exports to import dive site, country, and buddy info
 - **View** dive logs in an interactive TUI with depth/temperature/pressure charts
 - **Export** dives as FIT activities, for apps that overlay Garmin Descent dive data on video
@@ -45,17 +45,37 @@ dive-rs scan --enumerate   # also list GATT services
 ### Download dive logs
 
 ```bash
-dive-rs download                          # saves to dives.json
-dive-rs download -o my_dives.json         # custom output path
-dive-rs download --save-raw raw_data/     # also save raw binary data
+dive-rs sirius download                       # saves to dives.json
+dive-rs sirius download -o my_dives.json      # custom output path
+dive-rs sirius download --save-raw raw_data/  # also save raw binary data
+dive-rs sirius info                           # model, serial, firmware
+
+dive-rs dsx download                          # the same from an Apeks DSX
+dive-rs dsx download --since 2026-11-01       # leave out older dives, of a former owner
+dive-rs dsx info
 ```
 
-Re-running `download` is incremental — only new dives are fetched.
+Re-running a download is incremental — only new dives are fetched. The date given to `--since` is remembered for that DSX.
 
-### Parse raw data offline
+### Two computers, one dive
+
+All dives go to `dives.json`. A dive already there from another computer, at the same time and about the same depth, becomes one entry whichever computer is downloaded first:
+
+- The profile comes from the computer that samples more often, 2 s on a DSX against 5 s on a Sirius, with its depths, temperatures and dive time.
+- The other computer fills in what that one lacks, sample by sample once the two profiles are lined up: tank pressure from a transmitter, no-deco time, alarms. So do its dive figures, such as battery levels and gradient factors.
+- Gases come from the computer that knows the tanks.
+- The site, country, buddy and everything else set by hand stay.
+
+Dives more than 10 minutes apart at the start stay separate, so the clocks of both computers must be about right. The originals are not kept apart in the file.
+
+### Advanced
+
+Commands for working on the protocols, not for everyday use:
 
 ```bash
-dive-rs parse --raw-dir raw_data/
+dive-rs advanced parse --raw-dir raw_data/    # parse saved raw data offline
+dive-rs advanced debug                        # test ECOP SDO communication
+dive-rs advanced sdo 0x2000:4                 # read raw SDO objects
 ```
 
 ### Correlate with SSI export
@@ -81,7 +101,7 @@ dive-rs view
 
 Navigate with `j`/`k` or arrow keys. Toggle overlays with `d` (depth), `t` (temperature), `p` (pressure). Quit with `q`.
 
-Dives are listed by date and numbered as the SSI logbook numbers them: in that order, scuba dives and freedive sessions each on their own, ignored dives not counted. The number a dive has on the watch shows next to its title. `fit` names dives by the same logbook number. In the list the number is yellow, or cyan for a freedive session.
+Dives are listed by date and numbered as the SSI logbook numbers them: in that order, scuba dives and freedive sessions each on their own, ignored dives not counted. The number a dive has on each computer shows next to its title. `fit` names dives by the same logbook number. In the list the number is yellow, or cyan for a freedive session.
 
 Press `s` for a page of statistics over the whole logbook: totals and records, dives per year and per month of the year with a colour per country, time under water, depths, and the air used per minute at the surface month after month. That last figure, also shown with each dive, is the gas gone from the tank over the dive time and the mean pressure; it needs a transmitter and is only as right as the tank size the watch was given.
 

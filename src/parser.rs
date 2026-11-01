@@ -267,6 +267,7 @@ pub fn parse_dive_ecop(dive_index: u32, header: &[u8], profile: &[u8]) -> Result
         utc_offset: None,
         buddy: None,
         ignored: false,
+        ..Default::default()
     })
 }
 

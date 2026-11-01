@@ -1,5 +1,5 @@
 //! Apeks DSX support. Experimental: written from libdivecomputer and
-//! DiverLog+, not yet run against a device.
+//! DiverLog+, tried on one device so far.
 
 pub mod parser;
 pub mod protocol;
@@ -10,9 +10,10 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use btleplug::platform::Peripheral;
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::NaiveDate;
 
 use crate::ble::{self, BleConnection};
+use crate::merge;
 use crate::types::{DiveData, DiveLog};
 
 use parser::{FlashMap, LogbookEntry};
@@ -232,7 +233,6 @@ pub async fn cmd_download(
         None => load_since(&since_file)?,
     };
 
-    // Tell dives apart by start time too
     let mut existing_dives: Vec<DiveLog> = Vec::new();
     if output.exists() {
         let contents = std::fs::read_to_string(&output)
@@ -246,9 +246,9 @@ pub async fn cmd_download(
         );
         existing_dives = data.dives;
     }
-    let existing: HashSet<(u32, NaiveDateTime)> = existing_dives
+    let existing: HashSet<u32> = existing_dives
         .iter()
-        .map(|dive| (dive.number, dive.datetime))
+        .filter_map(|dive| dive.dsx_number)
         .collect();
 
     let (mut conn, id) = open(peripheral, name).await?;
@@ -290,7 +290,7 @@ pub async fn cmd_download(
                 continue;
             }
 
-            if existing.contains(&(entry.number, entry.datetime)) {
+            if existing.contains(&entry.number) {
                 skipped += 1;
                 continue;
             }
@@ -324,7 +324,7 @@ pub async fn cmd_download(
                 Ok(dive) => {
                     eprintln!(
                         "\r  Dive #{}: {} | {:.1}m | {}s | {} samples",
-                        dive.number,
+                        entry.number,
                         dive.datetime.format("%Y-%m-%d %H:%M"),
                         dive.max_depth_m,
                         dive.duration_seconds,
@@ -358,8 +358,10 @@ pub async fn cmd_download(
     eprintln!("Downloaded {} new dive(s)", new_dives.len());
 
     let mut all_dives = existing_dives;
-    all_dives.append(&mut new_dives);
-    all_dives.sort_by_key(|dive| (dive.datetime, dive.number));
+    let merged = merge::add_dives(&mut all_dives, new_dives);
+    if merged > 0 {
+        eprintln!("Merged {merged} into the entry another computer had for the same dive");
+    }
 
     let data = DiveData { dives: all_dives };
     std::fs::write(&output, serde_json::to_string_pretty(&data)?)?;

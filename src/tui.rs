@@ -687,6 +687,9 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) {
     if let Some(sac) = sac_l_min(dive) {
         right_col.push(format!(" Air:       {sac:.1} l/min at the surface"));
     }
+    if let Some(start) = dive.start_position {
+        right_col.push(format!(" GPS:       {:.5}, {:.5}", start.lat, start.lon));
+    }
     if !dive.gradient_factors.is_empty() {
         let sets: Vec<String> = dive
             .gradient_factors
@@ -713,11 +716,14 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) {
         Some(number) => format!("  Dive #{number}  "),
         None => "  Dive  ".to_string(),
     };
-    // The number the dive has on the watch, to find it there
-    let on_watch = match dive.number {
+    // The number the dive has on each computer, to find it there
+    let mut on_watch = match dive.number {
         0 => String::new(),
         number => format!("    watch #{number}"),
     };
+    if let Some(number) = dive.dsx_number {
+        on_watch += &format!("    DSX #{number}");
+    }
     let mode = format!("{:?}", dive.dive_mode);
     let count = if dive.dips.is_empty() {
         format!("    ({} samples)", dive.samples.len())
@@ -1595,6 +1601,23 @@ mod tests {
         row_of(&text, "Site:      Ras il-Hobz");
         row_of(&text, "No sample data");
         assert!(!text.contains("Gas:"));
+    }
+
+    #[test]
+    fn numbers_on_both_computers_and_the_position_show() {
+        let mut dives = three_dives();
+        for dive in &mut dives {
+            dive.dsx_number = Some(20);
+            dive.start_position = Some(crate::types::Position {
+                lat: 36.0175,
+                lon: 14.2528,
+            });
+        }
+        let mut app = App::new(PathBuf::new(), dives);
+
+        let text = screen(&mut app, 120, 36);
+        assert!(text.contains("DSX #20"));
+        row_of(&text, "GPS:       36.01750, 14.25280");
     }
 
     #[test]

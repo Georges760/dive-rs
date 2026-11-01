@@ -178,12 +178,22 @@ pub struct Dip {
     pub min_temp_c: Option<f64>,
 }
 
+/// A GPS position, in degrees.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Position {
+    pub lat: f64,
+    pub lon: f64,
+}
+
 /// A parsed dive log entry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiveLog {
-    /// Number the dive computer gives the dive; 0 for a dive that comes
-    /// from a logbook only. Not the number shown: see `logbook_numbers`.
+    /// Number the Mares watch gives the dive; 0 if it did not log it. Not
+    /// the number shown: see `logbook_numbers`.
     pub number: u32,
+    /// Number the Apeks DSX gives the dive, if it logged it
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub dsx_number: Option<u32>,
     #[serde(with = "datetime_format")]
     pub datetime: NaiveDateTime,
     /// When the watch closed the dive, surface timeout included
@@ -239,6 +249,11 @@ pub struct DiveLog {
     /// Dips of a freedive session; the watch keeps no depth samples for them
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub dips: Vec<Dip>,
+    /// Where the computer got a GPS fix on the way down and on the way out
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub start_position: Option<Position>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub end_position: Option<Position>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub site: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -260,7 +275,7 @@ impl DiveLog {
     /// Whether the dive was imported from a logbook: no dive computer
     /// handed it over, so it has no number of its own and no profile.
     pub fn is_logbook_only(&self) -> bool {
-        self.number == 0
+        self.number == 0 && self.dsx_number.is_none()
     }
 }
 
