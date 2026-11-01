@@ -257,8 +257,10 @@ pub fn parse_dive(entry: &LogbookEntry, profile: &[u8]) -> Result<DiveLog> {
     let max_depth_m = read_u16_le(profile, footer + 10) as f64 / 10.0 * FEET;
 
     // Erased or zeroed slots are padding, not samples
-    let slots: Vec<&[u8]> = profile[HEADER_SIZE..footer]
-        .chunks_exact(SAMPLE_SIZE)
+    let slots: Vec<&[u8; SAMPLE_SIZE]> = profile[HEADER_SIZE..footer]
+        .as_chunks::<SAMPLE_SIZE>()
+        .0
+        .iter()
         .filter(|sample| {
             !sample.iter().all(|&byte| byte == 0x00) && !sample.iter().all(|&byte| byte == 0xFF)
         })
