@@ -2,14 +2,14 @@ use std::cell::Cell as StateCell;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use blit::{Atom, Constraints, Input, Key, LogicalRect, Sense, Sides, Size, Sizing, WidgetId};
+use blit::{Atom, AtomCx, Constraints, Id, Input, Key, PhysicalRect, Sides, Size, Sizing};
 use blit_tui::atom::{Border, TitlePosition};
 use blit_tui::cell::{Cell, CellStyle};
 use blit_tui::color::Color;
 use blit_tui::layout::{flex, Justify};
 use blit_tui::text::{Span, TextAttributes, TextOptions, TextOverflow, TextWrap};
-use blit_tui::widget::{scroll_list, Block, Text, Title};
-use blit_tui::{TuiContext, Ui};
+use blit_tui::widget::{Block, ScrollState, Text, Title, UniformList};
+use blit_tui::{interact, BoundsClip, TuiContext, Ui};
 
 use crate::stats::{sac_l_min, stats, Period, Stats};
 use crate::types::{logbook_numbers, DiveData, DiveLog, DiveMode, SafetyStop, Sample, Water};
@@ -25,7 +25,7 @@ struct App {
     listed: Vec<usize>,
     /// Row of the list that is selected
     selected: usize,
-    scroll: scroll_list::State,
+    scroll: ScrollState,
     show_depth: bool,
     show_temp: bool,
     show_pressure: bool,
@@ -48,7 +48,7 @@ impl App {
             numbers: Vec::new(),
             listed: Vec::new(),
             selected: 0,
-            scroll: scroll_list::State::new(),
+            scroll: ScrollState::new(),
             show_depth: true,
             show_temp: true,
             show_pressure: true,
@@ -118,7 +118,7 @@ impl App {
     }
 
     /// Apply one input event. Returns true when the user asked to quit.
-    fn handle_input(&mut self, input: Input) -> bool {
+    fn handle_input(&mut self, input: Input<i32>) -> bool {
         // On the statistics page the list is out of sight and of reach
         if self.stats.is_some() {
             match input {
@@ -165,19 +165,19 @@ impl App {
 
     /// Keep the selected row inside the list viewport (rows are one cell high).
     fn scroll_to_selected(&mut self) {
-        let row = self.selected as f32;
+        let row = self.selected as i32;
         let visible = self.scroll.viewport_extent;
         if row < self.scroll.offset {
-            self.scroll.scroll_to(row);
-        } else if visible > 0.0 && row + 1.0 > self.scroll.offset + visible {
-            self.scroll.scroll_to(row + 1.0 - visible);
+            self.scroll.scroll_to(row, None);
+        } else if visible > 0 && row + 1 > self.scroll.offset + visible {
+            self.scroll.scroll_to(row + 1 - visible, None);
         }
     }
 
     fn render(&mut self, mut ui: Ui<'_>) {
-        let input = *ui.input();
+        let input = ui.input();
         if self.handle_input(input) {
-            ui.context().quit();
+            ui.context_mut().quit();
             return;
         }
 
@@ -207,7 +207,7 @@ impl App {
             (false, count) => format!(" i ignore  a show {count} ignored "),
         };
 
-        let mut panel = ui.layout(flex::column().padding(Sides::all(1.0)));
+        let mut panel = ui.layout(flex::column().padding(Sides::all(1)));
         panel.insert(
             panel_block(" Dive Log ").title(
                 Title::new(&hint)
@@ -219,19 +219,19 @@ impl App {
         let selected = self.selected;
         let numbers = &self.numbers;
         let mut clicked = None;
-        panel
-            .child()
-            .item(flex::item().grow())
-            .build(scroll_list::new(
+        panel.child().item(flex::item().grow()).build(
+            UniformList::new(
                 &mut self.scroll,
-                scroll_list::Config::new(1.0),
                 self.listed
                     .iter()
                     .map(|&dive| (dive, &self.dives[dive]))
                     .enumerate(),
-                |(_, (dive, _))| WidgetId::new(("dive", *dive)),
+            )
+            .id(|_, _, (_, (dive, _)): &(usize, (usize, &DiveLog))| Id::new(("dive", *dive)))
+            .clip(BoundsClip)
+            .build_scrollbar(
                 |mut ui: Ui<'_>, (index, (dive_index, dive))| {
-                    if ui.interact(Sense::CLICK).clicked {
+                    if ui.interact(interact::press()).clicked {
                         clicked = Some(index);
                     }
                     // An ignored dive is not counted
@@ -261,15 +261,17 @@ impl App {
                         ]));
                     }
                 },
-                |active| {
+                |_: Ui<'_>| {},
+                |mut ui: Ui<'_>, active| {
                     let thumb = if active {
                         Color::CYAN
                     } else {
                         Color::DARK_GRAY
                     };
-                    (Some(Block::new()), Some(Block::new().background(thumb)))
+                    ui.insert(Block::new().background(thumb));
                 },
-            ));
+            ),
+        );
 
         // Under the list, over as many lines as it takes
         if let Some(error) = &self.error {
@@ -290,7 +292,7 @@ impl App {
 
     fn render_detail_panel(&self, ui: Ui<'_>) {
         let Some(index) = self.current() else {
-            let mut panel = ui.layout(flex::column().padding(Sides::all(1.0)));
+            let mut panel = ui.layout(flex::column().padding(Sides::all(1)));
             panel.insert(panel_block(" Dive Details "));
             panel
                 .child()
@@ -317,7 +319,7 @@ impl App {
             return;
         }
 
-        let mut panel = ui.layout(flex::column().padding(Sides::all(1.0)));
+        let mut panel = ui.layout(flex::column().padding(Sides::all(1)));
         panel.insert(
             panel_block(" Depth Profile ").title(
                 Title::new(" d depth  t temp  p pressure  s stats  q quit ")
@@ -344,18 +346,17 @@ impl App {
 
         // Pressing or dragging on the chart picks the sample under the pointer.
         // Done before the legend row is built so its readout is not a frame late.
-        let chart_id = WidgetId::new("depth chart");
-        if panel
-            .interact_widget(chart_id, Sense::CLICK_AND_DRAG)
-            .active
-        {
-            if let (Some(area), Some(pointer)) =
-                (panel.geometry(chart_id), panel.pointer_position())
-            {
-                let plot_x = area.x + LineChart::GUTTER as f32;
-                let plot_width = (area.width - LineChart::GUTTER as f32).max(1.0);
+        // The area is only known if asked for on every frame
+        let chart_id = Id::new("depth chart");
+        let area = panel.area(chart_id);
+        let pressed = panel.interact_widget(chart_id, interact::press()).active;
+        let dragged = panel.interact_widget(chart_id, interact::drag()).active;
+        if pressed || dragged {
+            if let (Some(area), Some(pointer)) = (area, panel.pointer_position()) {
+                let plot_x = (area.x + LineChart::GUTTER as i32) as f32;
+                let plot_width = (area.width - LineChart::GUTTER as i32).max(1) as f32;
                 let time_s =
-                    ((pointer.x - plot_x) / plot_width).clamp(0.0, 1.0) * time_bound * 60.0;
+                    ((pointer.x as f32 - plot_x) / plot_width).clamp(0.0, 1.0) * time_bound * 60.0;
                 let nearest = dive
                     .samples
                     .iter()
@@ -491,11 +492,7 @@ impl App {
             // The legend gives way when the two do not fit: the readout is
             // what the click asked for
             top.child()
-                .item(
-                    flex::item()
-                        .width(Sizing::grow())
-                        .height(Sizing::fixed(1.0)),
-                )
+                .item(flex::item().width(Sizing::grow()).height(Sizing::fixed(1)))
                 .insert(Text::rich(&spans).options(one_line));
             top.child().insert(Text::rich(&readout_spans));
         }
@@ -504,11 +501,7 @@ impl App {
         // even with no sample picked, so that the chart does not move.
         if dive.samples[0].speed_m_min.is_some() {
             let [state, signals, alarms] = picked.map(sample_readout).unwrap_or_default();
-            let row = || {
-                flex::item()
-                    .width(Sizing::grow())
-                    .height(Sizing::fixed(1.0))
-            };
+            let row = || flex::item().width(Sizing::grow()).height(Sizing::fixed(1));
             panel
                 .child()
                 .item(row())
@@ -525,7 +518,7 @@ impl App {
         panel
             .child()
             .item(flex::item().grow())
-            .widget_id(chart_id)
+            .id(chart_id)
             .insert(LineChart {
                 series,
                 x_max: time_bound,
@@ -727,7 +720,7 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) {
         right_col.push(format!(" Ascent:    {speed:.1} m/min max"));
     }
 
-    let mut panel = ui.layout(flex::column().padding(Sides::all(1.0)));
+    let mut panel = ui.layout(flex::column().padding(Sides::all(1)));
     panel.insert(panel_block(" Dive Details "));
 
     // Title line
@@ -892,7 +885,7 @@ fn sample_readout(sample: &Sample) -> [String; 3] {
 
 /// Freedive sessions have no depth samples: list the dips instead of a chart.
 fn render_dips_table(ui: Ui<'_>, dive: &DiveLog) {
-    let mut panel = ui.layout(flex::column().padding(Sides::all(1.0)));
+    let mut panel = ui.layout(flex::column().padding(Sides::all(1)));
     panel.insert(panel_block(" Dips "));
 
     panel.child().insert(
@@ -960,7 +953,7 @@ fn render_stats(ui: Ui<'_>, stats: &Stats) {
         let mut panel = page
             .child()
             .item(fit())
-            .layout(flex::column().padding(Sides::all(1.0)));
+            .layout(flex::column().padding(Sides::all(1)));
         panel.insert(
             panel_block(" Statistics ").title(
                 Title::new(" s dive log  q quit ")
@@ -1033,7 +1026,7 @@ fn render_stats(ui: Ui<'_>, stats: &Stats) {
             .collect()
     };
     let chart = |ui: Ui<'_>, title: &str, rows: Vec<BarRow>| {
-        let mut panel = ui.layout(flex::column().padding(Sides::all(1.0)));
+        let mut panel = ui.layout(flex::column().padding(Sides::all(1)));
         panel.insert(panel_block(title));
         panel.child().item(fit()).insert(BarChart { rows });
     };
@@ -1111,12 +1104,12 @@ struct BarChart {
 }
 
 impl Atom<TuiContext> for BarChart {
-    fn measure(&self, _: &mut TuiContext, constraints: Constraints) -> Size {
-        constraints.constrain(Size::new(0.0, self.rows.len() as f32))
+    fn measure(&self, _: &mut AtomCx<'_, TuiContext>, constraints: Constraints<i32>) -> Size<i32> {
+        constraints.constrain(Size::new(0, self.rows.len() as i32))
     }
 
-    fn paint(&self, context: &mut TuiContext, area: LogicalRect) {
-        let mut cells = context.cells(area);
+    fn paint(&self, cx: &mut AtomCx<'_, TuiContext>, area: PhysicalRect) {
+        let mut cells = cx.context_mut().cells(area);
         let width = |text: &String| text.chars().count();
         // A blank on each side of the labels
         let labels = self
@@ -1170,10 +1163,6 @@ impl Atom<TuiContext> for BarChart {
             cells.write(labels + end + 1, y, &row.text, CellStyle::new());
         }
     }
-
-    fn paint_bounds(&self, area: LogicalRect) -> LogicalRect {
-        area
-    }
 }
 
 /// One curve of a [`LineChart`]: (minutes, metres below the surface).
@@ -1197,12 +1186,12 @@ impl LineChart {
 }
 
 impl Atom<TuiContext> for LineChart {
-    fn measure(&self, _: &mut TuiContext, constraints: Constraints) -> Size {
+    fn measure(&self, _: &mut AtomCx<'_, TuiContext>, constraints: Constraints<i32>) -> Size<i32> {
         constraints.constrain(Size::ZERO)
     }
 
-    fn paint(&self, context: &mut TuiContext, area: LogicalRect) {
-        let mut cells = context.cells(area);
+    fn paint(&self, cx: &mut AtomCx<'_, TuiContext>, area: PhysicalRect) {
+        let mut cells = cx.context_mut().cells(area);
         if cells.columns() <= Self::GUTTER + 2 || cells.rows() <= 3 {
             return;
         }
@@ -1302,17 +1291,13 @@ impl Atom<TuiContext> for LineChart {
             }
         }
     }
-
-    fn paint_bounds(&self, area: LogicalRect) -> LogicalRect {
-        area
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use blit::{Frame, FrameInfo, LayoutResolution, LogicalSize};
+    use blit::{Frame, FrameInfo, KeyInput, Modifiers, Point, PointerButton};
     use blit_tui::{RendererConfig, TuiRenderer};
 
     use super::*;
@@ -1325,20 +1310,20 @@ mod tests {
 
     /// Render the viewer off-screen.
     fn render(app: &mut App, columns: u16, rows: u16) -> TuiContext {
+        render_after(app, columns, rows, &[])
+    }
+
+    /// Render the viewer off-screen once it has taken `inputs`, a frame each.
+    fn render_after(app: &mut App, columns: u16, rows: u16, inputs: &[Input<i32>]) -> TuiContext {
         let renderer = TuiRenderer::new(RendererConfig::new().columns(columns).rows(rows));
         let mut context = TuiContext::new(renderer);
         let mut frame: Frame<TuiContext> = Frame::default();
-        let info = FrameInfo::new(LogicalSize::new(columns as f32, rows as f32)).layout_resolution(
-            LayoutResolution::Discrete {
-                step: LogicalSize::uniform(1.0),
-            },
-        );
-        // Twice: the list and the chart place themselves from the frame before
-        for pass in 0..2 {
-            let now = Duration::from_millis(pass * 10);
-            frame.build(&mut context, info, now, Input::None, |ui: Ui<'_>| {
-                app.render(ui)
-            });
+        let info = FrameInfo::new(Size::new(columns as i32, rows as i32));
+        // Twice first: the list and the chart place themselves from the frame before
+        let inputs = [Input::None, Input::None].iter().chain(inputs);
+        for (pass, &input) in inputs.enumerate() {
+            let now = Duration::from_millis(pass as u64 * 10);
+            frame.build(&mut context, info, now, input, |ui: Ui<'_>| app.render(ui));
             frame.layout(&mut context);
         }
         context.begin_paint();
@@ -1511,6 +1496,81 @@ mod tests {
                 ..plain_dive()
             })
             .collect()
+    }
+
+    fn press(x: usize, y: usize) -> Input<i32> {
+        Input::PointerDown {
+            position: Point::new(x as i32, y as i32),
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    fn release(x: usize, y: usize) -> Input<i32> {
+        Input::PointerUp {
+            position: Point::new(x as i32, y as i32),
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+            leave: false,
+        }
+    }
+
+    fn move_to(x: usize, y: usize) -> Input<i32> {
+        Input::PointerMove {
+            position: Point::new(x as i32, y as i32),
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    fn key(key: Key) -> Input<i32> {
+        Input::Key(KeyInput::new(key))
+    }
+
+    #[test]
+    fn list_follows_the_keys_and_the_mouse() {
+        let dives = (1..=40)
+            .map(|number| DiveLog {
+                number,
+                ..plain_dive()
+            })
+            .collect();
+        let mut app = App::new(PathBuf::new(), dives);
+        let text = |app: &mut App, inputs: &[Input<i32>]| {
+            render_after(app, 120, 20, inputs).renderer().plain_text()
+        };
+
+        // The list scrolls to keep the selected dive in sight
+        let last = text(&mut app, &[key(Key::End)]);
+        row_of(&last, "Dive #1  Air");
+        assert!(row_of(&last, " #1 ") < 19 && !last.contains(" #40 "));
+        let first = text(&mut app, &[key(Key::Home)]);
+        row_of(&first, "Dive #40  Air");
+        assert!(!first.contains(" #1 "));
+
+        // A click picks a row
+        let row = row_of(&first, " #38 ");
+        let clicked = text(&mut app, &[press(4, row), release(4, row)]);
+        row_of(&clicked, "Dive #38  Air");
+    }
+
+    #[test]
+    fn pressing_or_dragging_on_the_chart_picks_a_sample() {
+        let mut app = App::new(PathBuf::new(), vec![plain_dive()]);
+        let shown = screen(&mut app, 120, 36);
+        // The plot starts right of the axis on the line of the surface
+        let y = row_of(&shown, " 0m│");
+        let line = shown.lines().nth(y).unwrap();
+        let x = line[..line.find(" 0m│").unwrap()].chars().count() + 4;
+        let text = |app: &mut App, inputs: &[Input<i32>]| {
+            render_after(app, 120, 36, inputs).renderer().plain_text()
+        };
+
+        row_of(&text(&mut app, &[press(x, y)]), "00:00 (16:03:00)");
+        // Dragged to the far end of the time axis: the last sample
+        row_of(
+            &text(&mut app, &[press(x, y), move_to(116, y), release(116, y)]),
+            "00:10 (16:03:10)",
+        );
     }
 
     #[test]

@@ -15,5 +15,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 uuid = "1"
-blit = { git = "https://github.com/nicoburniske/blit", rev = "b90e8f76463baef6123d3ee2c20beeffee9d47de" }
-blit-tui = { git = "https://github.com/nicoburniske/blit", rev = "b90e8f76463baef6123d3ee2c20beeffee9d47de" }
+blit = { git = "https://github.com/nicoburniske/blit", rev = "d607d7ec8f7cd2fe2785a7837a32f7495844d34c" }
+blit-tui = { git = "https://github.com/nicoburniske/blit", rev = "d607d7ec8f7cd2fe2785a7837a32f7495844d34c" }
