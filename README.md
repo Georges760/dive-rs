@@ -48,6 +48,7 @@ dive-rs scan --enumerate   # also list GATT services
 dive-rs sirius download                       # saves to dives.json
 dive-rs sirius download -o my_dives.json      # custom output path
 dive-rs sirius download --save-raw raw_data/  # also save raw binary data
+dive-rs sirius download -n 1                  # only the most recent dive
 dive-rs sirius info                           # model, serial, firmware
 
 dive-rs dsx download                          # the same from an Apeks DSX
@@ -55,7 +56,7 @@ dive-rs dsx download --since 2026-11-01       # leave out older dives, of a form
 dive-rs dsx info
 ```
 
-Re-running a download is incremental — only new dives are fetched. The date given to `--since` is remembered for that DSX.
+Re-running a download is incremental — only new dives are fetched. With `-n N`, on either computer, it stops after the N most recent dives, new or already downloaded, instead of reading every header. The date given to `--since` is remembered for that DSX.
 
 ### Two computers, one dive
 

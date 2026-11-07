@@ -408,9 +408,9 @@ pub async fn read_freedive_data(conn: &mut BleConnection, dive_index: u16) -> Re
     ecop_read(conn, index, 5).await
 }
 
-/// Enumerate dive objects by trying to open them sequentially.
-/// Returns the number of valid dive objects found.
-pub async fn count_dives(conn: &mut BleConnection) -> Result<u16> {
+/// Enumerate dive objects by trying to open them sequentially, newest first.
+/// Returns the number of valid dive objects found, at most `limit`.
+pub async fn count_dives(conn: &mut BleConnection, limit: u16) -> Result<u16> {
     let mut count = 0u16;
 
     // Build BF payload for index 0x3000+count, sub 4
@@ -441,7 +441,7 @@ pub async fn count_dives(conn: &mut BleConnection) -> Result<u16> {
         count += 1;
 
         // Safety limit
-        if count >= 256 {
+        if count >= limit.min(256) {
             break;
         }
     }

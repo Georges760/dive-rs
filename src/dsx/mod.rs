@@ -221,6 +221,7 @@ pub async fn cmd_download(
     output: PathBuf,
     save_raw: Option<PathBuf>,
     since: Option<NaiveDate>,
+    last: Option<u16>,
 ) -> Result<()> {
     // A used DSX still holds the dives of its former owner: the date stays
     // with the device, so that they do not come back on the next download
@@ -268,8 +269,13 @@ pub async fn cmd_download(
             std::fs::write(raw_dir.join("flash_map.bin"), &flash_map)?;
         }
 
-        let entries = FlashMap::parse(&flash_map)?.logbook_entries()?;
+        let mut entries = FlashMap::parse(&flash_map)?.logbook_entries()?;
         eprintln!("Found {} logbook entr(ies)", entries.len());
+        // Newest first: --last keeps to the most recent ones
+        if let Some(last) = last.filter(|&last| (last as usize) < entries.len()) {
+            entries.truncate(last as usize);
+            eprintln!("Checking the {last} most recent dive(s)");
+        }
 
         for (i, &address) in entries.iter().enumerate() {
             eprint!("\rChecking dive {}/{}...", i + 1, entries.len());

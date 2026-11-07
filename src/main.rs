@@ -204,6 +204,11 @@ enum SiriusCommand {
         /// Save raw dive data for debugging
         #[arg(long)]
         save_raw: Option<PathBuf>,
+
+        /// Stop after the N most recent dives on the device, new or already
+        /// downloaded, instead of going through all of them
+        #[arg(short = 'n', long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..))]
+        last: Option<u16>,
     },
 }
 
@@ -245,6 +250,11 @@ enum DsxCommand {
         /// former owner of the DSX. Remembered for this device.
         #[arg(long)]
         since: Option<chrono::NaiveDate>,
+
+        /// Stop after the N most recent dives on the device, new or already
+        /// downloaded, instead of going through all of them
+        #[arg(short = 'n', long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..))]
+        last: Option<u16>,
     },
 }
 
@@ -303,7 +313,8 @@ async fn main() -> Result<()> {
                 output,
                 format,
                 save_raw,
-            } => cmd_download(address, output, format, save_raw).await,
+                last,
+            } => cmd_download(address, output, format, save_raw, last).await,
         },
         Commands::Advanced { command } => match command {
             AdvancedCommand::Debug { address } => cmd_debug(address).await,
@@ -453,8 +464,9 @@ async fn cmd_dsx(command: DsxCommand) -> Result<()> {
             output,
             save_raw,
             since,
+            last,
             ..
-        } => dsx::cmd_download(&peripheral, &name, output, save_raw, since).await,
+        } => dsx::cmd_download(&peripheral, &name, output, save_raw, since, last).await,
     }
 }
 
@@ -527,7 +539,7 @@ async fn cmd_debug(address: Option<String>) -> Result<()> {
 
     // Step 4: Count dives
     eprintln!("\n--- Step 4: Count dive objects ---");
-    match protocol::count_dives(&mut conn).await {
+    match protocol::count_dives(&mut conn, u16::MAX).await {
         Ok(count) => eprintln!("  Found {count} dive object(s)"),
         Err(e) => eprintln!("  Count failed: {e}"),
     }
@@ -622,7 +634,7 @@ async fn cmd_info(address: Option<String>) -> Result<()> {
     };
 
     // Count dives
-    let dive_count = match protocol::count_dives(&mut conn).await {
+    let dive_count = match protocol::count_dives(&mut conn, u16::MAX).await {
         Ok(n) => n,
         Err(e) => {
             eprintln!("Warning: could not count dives: {e}");
@@ -649,6 +661,7 @@ async fn cmd_download(
     output: PathBuf,
     format: OutputFormat,
     save_raw: Option<PathBuf>,
+    last: Option<u16>,
 ) -> Result<()> {
     // Load existing dives from output file (if any) for incremental download
     let mut existing_dives: Vec<DiveLog> = Vec::new();
@@ -691,9 +704,12 @@ async fn cmd_download(
         eprintln!("Warning: could not set datetime: {e}");
     }
 
-    // Count dives
-    let dive_count = protocol::count_dives(&mut conn).await?;
-    eprintln!("Found {} dive(s)", dive_count);
+    // Count dives. Index 0 is the newest: --last needs no more counted.
+    let dive_count = protocol::count_dives(&mut conn, last.unwrap_or(u16::MAX)).await?;
+    match last {
+        Some(_) => eprintln!("Checking the {dive_count} most recent dive(s)"),
+        None => eprintln!("Found {dive_count} dive(s)"),
+    }
 
     if dive_count == 0 {
         eprintln!("No dives on device.");
