@@ -1128,6 +1128,12 @@ fn parse_ssi_csv(contents: &str) -> Vec<SsiRecord> {
     records
 }
 
+/// Farthest apart, in minutes, a dive can start from its SSI entry when no
+/// entry has its minute. The logbook has the start of the computer that
+/// handed it the dive, and another computer of the same dive, whose start
+/// the entry kept, may have started a minute or two apart.
+const SSI_START_GAP_MIN: i64 = 5;
+
 fn cmd_correlate(csv_path: PathBuf, json_path: PathBuf) -> Result<()> {
     use chrono::{Datelike, Timelike};
 
@@ -1148,35 +1154,48 @@ fn cmd_correlate(csv_path: PathBuf, json_path: PathBuf) -> Result<()> {
     );
 
     // Build lookup by (year, month, day, hour, minute)
+    let minute = |datetime: chrono::NaiveDateTime| {
+        (
+            datetime.date().year(),
+            datetime.date().month(),
+            datetime.date().day(),
+            datetime.time().hour(),
+            datetime.time().minute(),
+        )
+    };
     let lookup: HashMap<(i32, u32, u32, u32, u32), &SsiRecord> = ssi_records
         .iter()
-        .map(|r| {
-            let key = (
-                r.datetime.date().year(),
-                r.datetime.date().month(),
-                r.datetime.date().day(),
-                r.datetime.time().hour(),
-                r.datetime.time().minute(),
-            );
-            (key, r)
-        })
+        .map(|r| (minute(r.datetime), r))
         .collect();
 
     let mut matched = 0u32;
     let mut unmatched = 0u32;
+    let mut matched_entries = HashSet::new();
 
     // Dives ignored in the viewer are not looked up
     let ignored = data.dives.iter().filter(|dive| dive.ignored).count();
+    // The entries some dive starts at the minute of
+    let taken: HashSet<_> = data
+        .dives
+        .iter()
+        .filter(|dive| !dive.ignored)
+        .map(|dive| minute(dive.datetime))
+        .filter(|key| lookup.contains_key(key))
+        .collect();
     for dive in data.dives.iter_mut().filter(|dive| !dive.ignored) {
-        let key = (
-            dive.datetime.date().year(),
-            dive.datetime.date().month(),
-            dive.datetime.date().day(),
-            dive.datetime.time().hour(),
-            dive.datetime.time().minute(),
-        );
+        let (start, freedive) = (dive.datetime, dive.dive_mode == DiveMode::Freedive);
+        let nearby = || {
+            lookup
+                .iter()
+                .filter(|(key, record)| !taken.contains(*key) && record.freedive == freedive)
+                .map(|(_, &record)| ((record.datetime - start).num_minutes().abs(), record))
+                .filter(|&(gap, _)| gap <= SSI_START_GAP_MIN)
+                .min_by_key(|&(gap, record)| (gap, record.datetime))
+                .map(|(_, record)| record)
+        };
 
-        if let Some(ssi) = lookup.get(&key) {
+        if let Some(ssi) = lookup.get(&minute(start)).copied().or_else(nearby) {
+            matched_entries.insert(ssi.datetime);
             if !ssi.site.is_empty() {
                 dive.site = Some(ssi.site.clone());
             }
@@ -1204,10 +1223,14 @@ fn cmd_correlate(csv_path: PathBuf, json_path: PathBuf) -> Result<()> {
         eprintln!("Left out {ignored} ignored dive(s)");
     }
 
-    // An SSI entry with no dive at its minute is a dive no dive computer
-    // handed over: import it, with what the logbook says about it
-    let mut known: HashSet<chrono::NaiveDateTime> =
-        data.dives.iter().map(|dive| dive.datetime).collect();
+    // An SSI entry no dive was found for is a dive no dive computer handed
+    // over: import it, with what the logbook says about it
+    let mut known: HashSet<chrono::NaiveDateTime> = data
+        .dives
+        .iter()
+        .map(|dive| dive.datetime)
+        .chain(matched_entries)
+        .collect();
     let mut imported = Vec::new();
     for record in &ssi_records {
         if !known.insert(record.datetime) {
@@ -1872,6 +1895,36 @@ mod tests {
             (47, &None, true)
         );
         assert_eq!(dives[1].site.as_deref(), Some("Red Rocks"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn correlate_finds_the_entry_a_minute_apart() {
+        let dir = scratch("correlate-apart");
+        let (json, ssi) = (dir.join("dives.json"), dir.join("ssi.csv"));
+        write_dives(&json);
+        // SSI got the dive from a computer that started a minute later
+        std::fs::write(
+            &ssi,
+            concat!(
+                "\"plongée #\",\"Site de plongée\",\"Pays\",\"Date / Heure\",",
+                "\"Type d'activité de plongée\",\"Plongée de Spécialité\",\"Type de plongée\",",
+                "\"Durée\",\"Profondeur\",\"Equipier / Instructor / Center\"\n",
+                "\"100\",\"Red Rocks\",\"Croatie\",\"26. Oct 2025 12:22\",\"Plongée Récréative\",",
+                "\"\",\"Exploration\",\"45 min\",\"24 m\",\"Venus\"\n",
+            ),
+        )
+        .unwrap();
+
+        cmd_correlate(ssi, json.clone()).unwrap();
+
+        // The dive gets the entry, which is not imported as another dive
+        let dives = read_dives(&json);
+        assert_eq!(dives.len(), 2);
+        assert_eq!(
+            (dives[1].site.as_deref(), dives[1].country.as_deref()),
+            (Some("Red Rocks"), Some("Croatie"))
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
