@@ -1041,7 +1041,7 @@ mod tests {
             "Pressure:  209 -> 99 bar",
             "Tank:      12 l, 200 bar",
             "Air:       8.7 l/min at the surface",
-            "GF:        85/85, 95/95",
+            "GF:        85/85",
             "CNS:       0.2 -> 5.7 %",
             "OTU:       0.5 -> 14.6",
             "Ascent:    14.9 m/min max",

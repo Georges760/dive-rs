@@ -287,13 +287,22 @@ pub fn dive_fields(dive: &DiveLog) -> [Vec<(&'static str, String)>; 2] {
             right.push((label, format!("{:.5}, {:.5}", at.lat, at.lon)));
         }
     }
-    if !dive.gradient_factors.is_empty() {
-        let sets: Vec<String> = dive
-            .gradient_factors
-            .iter()
-            .map(|gf| format!("{}/{}", gf.low, gf.high))
-            .collect();
-        right.push(("GF", sets.join(", ")));
+    // The gradient factors the dive went through, not the spare set the
+    // computer keeps: the first set when no sample tells
+    let mut used: Vec<u8> = Vec::new();
+    for sample in &dive.samples {
+        if !used.contains(&sample.gf_set) {
+            used.push(sample.gf_set);
+        }
+    }
+    let sets: Vec<String> = used
+        .iter()
+        .chain(used.is_empty().then_some(&0))
+        .filter_map(|&set| dive.gradient_factors.get(set as usize))
+        .map(|gf| format!("{}/{}", gf.low, gf.high))
+        .collect();
+    if !sets.is_empty() {
+        right.push(("GF", sets.join(" -> ")));
     }
     if let (Some(start), Some(end)) = (dive.cns_start_pct, dive.cns_end_pct) {
         right.push(("CNS", format!("{start:.1} -> {end:.1} %")));
@@ -659,6 +668,36 @@ pub fn stats_summary(stats: &Stats) -> [String; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::GradientFactors;
+
+    #[test]
+    fn only_the_gradient_factors_in_use_show() {
+        let gf = |value: &[(&str, String)]| {
+            value
+                .iter()
+                .find(|(label, _)| *label == "GF")
+                .map(|(_, gf)| gf.clone())
+        };
+        let mut dive = DiveLog {
+            gradient_factors: vec![
+                GradientFactors { low: 70, high: 80 },
+                GradientFactors { low: 95, high: 95 },
+            ],
+            samples: vec![Sample::default(); 3],
+            ..Default::default()
+        };
+        // The spare set is left out
+        assert_eq!(gf(&dive_fields(&dive)[1]).as_deref(), Some("70/80"));
+        // unless the diver switched to it
+        dive.samples[2].gf_set = 1;
+        assert_eq!(
+            gf(&dive_fields(&dive)[1]).as_deref(),
+            Some("70/80 -> 95/95")
+        );
+        // A dive without samples: the first set
+        dive.samples.clear();
+        assert_eq!(gf(&dive_fields(&dive)[1]).as_deref(), Some("70/80"));
+    }
 
     #[test]
     fn the_deco_stop_follows_the_computer() {
