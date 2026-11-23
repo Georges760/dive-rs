@@ -101,6 +101,10 @@ pub struct Tank {
     pub volume_l: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_bar: Option<u32>,
+    /// Pressures worked out rather than reported: the second tank of a
+    /// sidemount dive with a single transmitter
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub estimated: bool,
 }
 
 /// A single gas mix.
@@ -124,6 +128,9 @@ pub struct Sample {
     /// Tank pressure
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pressure_bar: Option<f64>,
+    /// Pressure of the second tank, the other one of a sidemount pair
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pressure2_bar: Option<f64>,
     /// Absolute pressure at the watch
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ambient_mbar: Option<u32>,

@@ -84,11 +84,18 @@ pub struct Stats {
 }
 
 /// Air a dive used, brought back to surface pressure, in l/min: the gas
-/// gone from the tank over the dive time and the mean absolute pressure.
-/// `None` without a transmitter or a tank size.
+/// gone from all its tanks over the dive time and the mean absolute
+/// pressure. `None` without a transmitter or without the size of a tank.
 pub fn sac_l_min(dive: &DiveLog) -> Option<f64> {
-    let tank = dive.gas_mixes.iter().find_map(|gas| gas.tank.as_ref())?;
-    let litres = (tank.start_bar - tank.end_bar) * tank.volume_l? as f64;
+    let mut tanks = dive
+        .gas_mixes
+        .iter()
+        .filter_map(|gas| gas.tank.as_ref())
+        .peekable();
+    tanks.peek()?;
+    let litres = tanks
+        .map(|tank| Some((tank.start_bar - tank.end_bar) * tank.volume_l? as f64))
+        .sum::<Option<f64>>()?;
 
     // Absolute pressure over the dive time; the log runs on at the surface
     let pressures: Vec<f64> = dive
@@ -260,6 +267,7 @@ mod tests {
                 end_bar: 100.0,
                 volume_l: Some(12),
                 working_bar: Some(200),
+                estimated: false,
             }),
             ..Default::default()
         }];
@@ -277,6 +285,21 @@ mod tests {
             },
         ];
         assert_eq!(sac_l_min(&dive), Some(10.0));
+
+        // In sidemount, the gas of the second tank counts as well
+        let mut sidemount = dive.clone();
+        sidemount.gas_mixes.push(GasMix {
+            o2: 21,
+            tank: Some(Tank {
+                start_bar: 200.0,
+                end_bar: 120.0,
+                volume_l: Some(12),
+                working_bar: Some(200),
+                estimated: true,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(sac_l_min(&sidemount), Some(18.0));
 
         // Month by month: only the months with such a dive
         let other = self::dive((2026, 7, 2), Some("Malte"), 10.0, 30);

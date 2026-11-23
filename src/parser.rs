@@ -218,6 +218,7 @@ pub fn parse_dive_ecop(dive_index: u32, header: &[u8], profile: &[u8]) -> Result
                 end_bar: end as f64 / 100.0,
                 volume_l: metric.then(|| read_u16_le(header, gas_offset + 8) as u32),
                 working_bar: metric.then(|| read_u16_le(header, gas_offset + 10) as u32),
+                estimated: false,
             });
             gas_mixes.push(GasMix { o2, he, tank });
         }
@@ -498,6 +499,8 @@ fn parse_ecop_profile(profile: &[u8], sample_interval: u32) -> Profile {
                     depth_m,
                     temp_c,
                     pressure_bar: last_pressure_bar,
+                    // The watch hears a single transmitter at a time
+                    pressure2_bar: None,
                     ambient_mbar: Some(read_u16_le(record, 6) as u32),
                     speed_m_min: Some(read_u16_le(record, 10) as i16 as f64 / 10.0),
                     ndl_min: (!in_deco).then_some(minutes),

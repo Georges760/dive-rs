@@ -270,6 +270,7 @@ fn fill_samples(
         or_source!(
             temp_c,
             pressure_bar,
+            pressure2_bar,
             ambient_mbar,
             speed_m_min,
             gas_time_min,
@@ -328,6 +329,7 @@ mod tests {
                     end_bar: 80.0,
                     volume_l: Some(12),
                     working_bar: Some(200),
+                    estimated: false,
                 }),
                 ..Default::default()
             }],

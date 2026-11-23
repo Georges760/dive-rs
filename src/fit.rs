@@ -207,6 +207,7 @@ struct Point {
     depth_m: f64,
     temp_c: Option<f64>,
     pressure_bar: Option<f64>,
+    pressure2_bar: Option<f64>,
     ambient_mbar: Option<f64>,
     /// Index of the sample this time falls under, for what the watch
     /// counts in steps: no-deco time, deco stop, gas time...
@@ -257,6 +258,7 @@ fn resample(samples: &[Sample], interval: u32) -> Vec<Point> {
                 depth_m: sample.depth_m,
                 temp_c: sample.temp_c,
                 pressure_bar: sample.pressure_bar,
+                pressure2_bar: sample.pressure2_bar,
                 ambient_mbar: sample.ambient_mbar.map(f64::from),
                 sample: index,
             })
@@ -290,6 +292,7 @@ fn resample(samples: &[Sample], interval: u32) -> Vec<Point> {
             depth_m: lerp(from.depth_m, to.depth_m),
             temp_c: lerp_some(from.temp_c, to.temp_c),
             pressure_bar: lerp_some(from.pressure_bar, to.pressure_bar),
+            pressure2_bar: lerp_some(from.pressure2_bar, to.pressure2_bar),
             ambient_mbar: lerp_some(
                 from.ambient_mbar.map(f64::from),
                 to.ambient_mbar.map(f64::from),
@@ -501,15 +504,19 @@ pub fn encode_dive(
             record.push((125, Value::Uint16(sac.unwrap_or(u16::MAX))));
         }
         fit.message(MESG_RECORD, &record);
-        if let Some(bar) = point.pressure_bar {
-            fit.message(
-                MESG_TANK_UPDATE,
-                &[
-                    (TIMESTAMP, Value::Uint32(begin + point.time_s)),
-                    (0, Value::Uint32z(TANK_SENSOR)),
-                    (1, pressure(bar)),
-                ],
-            );
+        // The second tank, of a sidemount pair, on the sensor after
+        let tanks = [point.pressure_bar, point.pressure2_bar];
+        for (sensor, bar) in (TANK_SENSOR..).zip(tanks) {
+            if let Some(bar) = bar {
+                fit.message(
+                    MESG_TANK_UPDATE,
+                    &[
+                        (TIMESTAMP, Value::Uint32(begin + point.time_s)),
+                        (0, Value::Uint32z(sensor)),
+                        (1, pressure(bar)),
+                    ],
+                );
+            }
         }
     }
 
@@ -526,24 +533,32 @@ pub fn encode_dive(
         fit.message(MESG_DEVICE_INFO, &device_info(end, dive.battery_end_pct));
     }
 
-    // Tank pressures as the watch sums them up, else the first and last readings
+    // Tank pressures as the watch sums them up, one summary per tank, else
+    // the first and last readings
     let mut pressures = points.iter().filter_map(|p| p.pressure_bar);
-    let tank = dive.gas_mixes.iter().find_map(|gas| gas.tank.as_ref());
-    let first_and_last = match tank {
-        Some(tank) => Some((tank.start_bar, tank.end_bar)),
-        None => pressures
+    let tanks: Vec<(f64, f64, Option<u32>)> = dive
+        .gas_mixes
+        .iter()
+        .filter_map(|gas| gas.tank.as_ref())
+        .map(|tank| (tank.start_bar, tank.end_bar, tank.volume_l))
+        .collect();
+    let tanks = if tanks.is_empty() {
+        let first_and_last = pressures
             .next()
-            .map(|first| (first, pressures.next_back().unwrap_or(first))),
+            .map(|first| (first, pressures.next_back().unwrap_or(first), None));
+        first_and_last.into_iter().collect()
+    } else {
+        tanks
     };
-    if let Some((first, last)) = first_and_last {
+    for (sensor, (first, last, litres)) in (TANK_SENSOR..).zip(tanks) {
         let mut summary = vec![
             (TIMESTAMP, Value::Uint32(end)),
-            (0, Value::Uint32z(TANK_SENSOR)),
+            (0, Value::Uint32z(sensor)),
             (1, pressure(first)), // start_pressure
             (2, pressure(last)),  // end_pressure
         ];
         // volume_used, in 1/100 l: the pressure drop times the tank size
-        if let Some(litres) = tank.and_then(|tank| tank.volume_l) {
+        if let Some(litres) = litres {
             let used = ((first - last).max(0.0) * litres as f64 * 100.0).round() as u32;
             summary.push((3, Value::Uint32(used)));
         }
@@ -872,6 +887,7 @@ mod tests {
             end_bar: 99.0,
             volume_l: Some(12),
             working_bar: Some(200),
+            estimated: false,
         });
 
         // 10 s: within the no-deco limit, the transmitter not heard yet
@@ -936,6 +952,48 @@ mod tests {
         let tank = find(323);
         assert_eq!((field(tank, 1), field(tank, 2)), (20_910, 9_900));
         assert_eq!(field(tank, 3), 132_120);
+    }
+
+    #[test]
+    fn each_tank_has_its_summary() {
+        // The second tank of a sidemount pair, estimated
+        let mut dive = full_dive();
+        let mut second = dive.gas_mixes[0].clone();
+        second.tank = Some(Tank {
+            start_bar: 209.1,
+            end_bar: 120.0,
+            volume_l: Some(12),
+            working_bar: Some(200),
+            estimated: true,
+        });
+        dive.gas_mixes.push(second);
+
+        let messages = decode(&encode_dive(&dive, 7, start(), 0, 0).unwrap());
+        let tanks: Vec<(u32, u32, u32)> = messages
+            .iter()
+            .filter(|message| message.0 == 323)
+            .map(|message| (field(message, 0), field(message, 2), field(message, 3)))
+            .collect();
+        assert_eq!(tanks, [(1, 9_900, 132_120), (2, 12_000, 106_920)]);
+    }
+
+    #[test]
+    fn the_second_tank_has_its_own_sensor() {
+        let mut dive = full_dive();
+        for (sample, bar) in dive
+            .samples
+            .iter_mut()
+            .zip([None, Some(205.0), Some(180.0)])
+        {
+            sample.pressure2_bar = bar;
+        }
+        let messages = decode(&encode_dive(&dive, 7, start(), 0, 0).unwrap());
+        let second: Vec<u32> = messages
+            .iter()
+            .filter(|message| message.0 == 319 && field(message, 0) == TANK_SENSOR + 1)
+            .map(|message| field(message, 1))
+            .collect();
+        assert_eq!(second, [20_500, 18_000]);
     }
 
     #[test]

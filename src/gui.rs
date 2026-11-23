@@ -42,6 +42,8 @@ mod colors {
     pub const DEPTH: Color = Color::rgb(76, 201, 240);
     pub const TEMP: Color = Color::rgb(255, 107, 107);
     pub const PRESSURE: Color = Color::rgb(105, 219, 124);
+    /// The second tank of a sidemount pair
+    pub const PRESSURE2: Color = Color::rgb(192, 235, 117);
     pub const TIME: Color = Color::rgb(255, 209, 102);
     pub const ALARM: Color = Color::rgb(247, 131, 172);
     pub const SCUBA: Color = Color::rgb(255, 209, 102);
@@ -497,20 +499,31 @@ impl App {
                 .child()
                 .item(flex::item().width(Sizing::grow()))
                 .insert(heading("Depth profile"));
-            let mut curves = vec![("Depth".to_string(), colors::DEPTH, 'd', self.show_depth)];
+            let mut curves = vec![(
+                vec![("Depth".to_string(), colors::DEPTH)],
+                'd',
+                self.show_depth,
+            )];
             if let Some(temp) = &profile.temp {
                 let label = format!("Temp {:.0}-{:.0} C", temp.min, temp.max);
-                curves.push((label, colors::TEMP, 't', self.show_temp));
+                curves.push((vec![(label, colors::TEMP)], 't', self.show_temp));
             }
             if let Some(pressure) = &profile.pressure {
                 let label = format!("Pressure {:.0}-{:.0} bar", pressure.max, pressure.min);
-                curves.push((label, colors::PRESSURE, 'p', self.show_pressure));
+                let mut tanks = vec![(label, colors::PRESSURE)];
+                // The second tank of a sidemount pair, "~" when estimated
+                if let Some(second) = &profile.pressure2 {
+                    let about = if second.estimated { "~" } else { "" };
+                    let label = format!("{about}{:.0}-{:.0} bar", second.max, second.min);
+                    tanks.push((label, colors::PRESSURE2));
+                }
+                curves.push((tanks, 'p', self.show_pressure));
             }
-            for (label, color, key, on) in curves {
+            for (labels, key, on) in curves {
                 let clicked = header
                     .child()
                     .id(Id::new(("button", key)))
-                    .build(|ui: Ui<'_>| curve_button(ui, &label, color, key, on));
+                    .build(|ui: Ui<'_>| curve_button(ui, &labels, key, on));
                 if clicked {
                     choice = Some(Choice::Key(key));
                 }
@@ -568,6 +581,9 @@ impl App {
         }
         if let Some(pressure) = profile.pressure.filter(|_| self.show_pressure) {
             curves.push((pressure.points, colors::PRESSURE));
+        }
+        if let Some(pressure) = profile.pressure2.filter(|_| self.show_pressure) {
+            curves.push((pressure.points, colors::PRESSURE2));
         }
         let depth = self.show_depth.then_some(profile.depth);
         let cursor = picked.map(|sample| (sample.time_s as f32 / 60.0, sample.depth_m as f32));
@@ -682,16 +698,20 @@ fn key_button<L: blit::Layout<DesktopContext>>(
         .build(|ui: Ui<'_>| button(ui, &[(label, colors::TEXT)], on))
 }
 
-/// A switch for a curve of the chart, a stroke of its colour first.
-fn curve_button(ui: Ui<'_>, label: &str, color: Color, key: char, on: bool) -> bool {
+/// A switch for curves of the chart, each label after a stroke of its colour.
+fn curve_button(ui: Ui<'_>, labels: &[(String, Color)], key: char, on: bool) -> bool {
     let key = format!("   {key}");
-    let stroke = if on { color } else { colors::MUTED };
     let text = if on { colors::TEXT } else { colors::MUTED };
-    button(
-        ui,
-        &[("━  ", stroke), (label, text), (&key, colors::MUTED)],
-        on,
-    )
+    let mut parts = Vec::new();
+    for (i, (label, color)) in labels.iter().enumerate() {
+        if i > 0 {
+            parts.push(("   ", colors::MUTED));
+        }
+        parts.push(("━  ", if on { *color } else { colors::MUTED }));
+        parts.push((label.as_str(), text));
+    }
+    parts.push((&key, colors::MUTED));
+    button(ui, &parts, on)
 }
 
 fn button(ui: Ui<'_>, label: &[(&str, Color)], on: bool) -> bool {

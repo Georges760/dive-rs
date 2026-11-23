@@ -316,6 +316,21 @@ impl App {
                 color: Color::GREEN,
             });
         }
+        // The second tank of a sidemount pair, "~" when estimated
+        if let Some(pressure) = profile.pressure2.filter(|_| self.show_pressure) {
+            let about = if pressure.estimated { "~" } else { "" };
+            legend.push((
+                format!(
+                    " ━ Press 2 ({about}{:.0}-{:.0}bar)",
+                    pressure.max, pressure.min
+                ),
+                Color::LIGHT_GREEN,
+            ));
+            series.push(Series {
+                points: pressure.points,
+                color: Color::LIGHT_GREEN,
+            });
+        }
 
         if self.show_depth {
             series.push(Series {
@@ -975,6 +990,7 @@ mod tests {
             end_bar: 99.0,
             volume_l: Some(12),
             working_bar: Some(200),
+            estimated: false,
         });
 
         let bottom = &mut dive.samples[1];
@@ -1030,6 +1046,31 @@ mod tests {
         ] {
             row_of(&screen, text);
         }
+    }
+
+    #[test]
+    fn an_estimated_tank_says_so() {
+        // The second tank of a sidemount pair, without a transmitter
+        let mut dive = full_dive();
+        let mut second = dive.gas_mixes[0].clone();
+        if let Some(tank) = second.tank.as_mut() {
+            (tank.end_bar, tank.estimated) = (120.0, true);
+        }
+        dive.gas_mixes.push(second);
+        dive.samples[1].pressure2_bar = Some(205.0);
+        dive.samples[2].pressure2_bar = Some(180.0);
+        let mut app = App::new(PathBuf::new(), vec![dive]);
+
+        let text = screen(&mut app, 160, 36);
+        row_of(&text, "Pressure:  209 -> 99, ~209 -> 120 bar");
+        // Its curve, next to that of the transmitter
+        row_of(&text, "━ Press 2 (~205-180bar) ━ Press (190-190bar)");
+
+        app.cursor.set(Some((0, 1)));
+        row_of(
+            &screen(&mut app, 120, 36),
+            "00:05 (16:03:05)  25.6 m  190 / ~205 bar  25.4 C",
+        );
     }
 
     #[test]
