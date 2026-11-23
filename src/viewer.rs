@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use crate::stats::{sac_l_min, Stats};
-use crate::types::{logbook_numbers, DiveData, DiveLog, DiveMode, SafetyStop, Sample, Water};
+use crate::types::{
+    logbook_numbers, DiveData, DiveLog, DiveMode, Position, SafetyStop, Sample, Water,
+};
 
 /// The dives of a file as the viewers list them.
 pub struct Logbook {
@@ -328,6 +330,14 @@ pub fn range(values: impl Iterator<Item = f64>) -> (f64, f64) {
     })
 }
 
+/// The page of Google Maps that shows a position.
+pub fn maps_url(at: Position) -> String {
+    format!(
+        "https://www.google.com/maps/search/?api=1&query={:.5},{:.5}",
+        at.lat, at.lon
+    )
+}
+
 /// Whether the second tank was worked out rather than reported.
 pub fn second_tank_estimated(dive: &DiveLog) -> bool {
     dive.gas_mixes
@@ -638,6 +648,18 @@ pub fn stats_summary(stats: &Stats) -> [String; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_position_has_its_page_on_google_maps() {
+        let at = Position {
+            lat: 35.868682,
+            lon: 14.351218,
+        };
+        assert_eq!(
+            maps_url(at),
+            "https://www.google.com/maps/search/?api=1&query=35.86868,14.35122"
+        );
+    }
 
     #[test]
     fn the_kind_of_dive_tells_sidemount_from_backmount() {

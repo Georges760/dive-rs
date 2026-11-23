@@ -23,8 +23,9 @@ use blit_gui_widgets::{interact, RichText, ScrollArea, ScrollState, Text, Unifor
 use crate::stats::{stats, Period, Stats};
 use crate::types::{DiveLog, DiveMode};
 use crate::viewer::{
-    alarm_text, computer_numbers, dip_rows, dive_fields, hours, mode_short, nearest_sample, range,
-    sample_readout, sample_values, stats_summary, tissue_range, Logbook, Overlay, Profile,
+    alarm_text, computer_numbers, dip_rows, dive_fields, hours, maps_url, mode_short,
+    nearest_sample, range, sample_readout, sample_values, stats_summary, tissue_range, Logbook,
+    Overlay, Profile,
 };
 
 /// Deep water, bright curves.
@@ -47,6 +48,7 @@ mod colors {
     pub const PRESSURE2: Color = Color::rgb(255, 236, 153);
     pub const TIME: Color = Color::rgb(255, 209, 102);
     pub const ALARM: Color = Color::rgb(247, 131, 172);
+    pub const LINK: Color = Color::rgb(116, 192, 252);
     pub const SCUBA: Color = Color::rgb(255, 209, 102);
     pub const FREEDIVE: Color = Color::rgb(76, 201, 240);
     /// Water under the surface of the chart, then down at the curve
@@ -120,6 +122,8 @@ enum Choice {
     Key(char),
     /// Select this row of the list
     Row(usize),
+    /// Open this page in the browser
+    Open(String),
 }
 
 struct App {
@@ -134,6 +138,8 @@ struct App {
     /// Sample picked on the chart, as (dive index, sample index). Set while
     /// the detail panel borrows the dive, hence the cell.
     cursor: Cell<Option<(usize, usize)>>,
+    /// How a page opens, in the browser
+    open_url: fn(&str),
 }
 
 impl Application for App {
@@ -164,6 +170,7 @@ impl App {
             show_pressure: true,
             stats: None,
             cursor: Cell::new(None),
+            open_url: open_in_browser,
         }
     }
 
@@ -260,6 +267,7 @@ impl App {
                 self.handle_input(Input::Text(key));
             }
             Some(Choice::Row(row)) => self.logbook.selected = row,
+            Some(Choice::Open(url)) => (self.open_url)(&url),
             None => return,
         }
         root.request_frame();
@@ -820,6 +828,7 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) -> Option<C
     }
 
     // Two columns of fields, each taking half of the width
+    let mut open = None;
     {
         let mut columns = panel
             .child()
@@ -831,8 +840,21 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) -> Option<C
                 .item(flex::item().width(Sizing::grow()))
                 .layout(flex::column().gap(5.0));
             for (label, value) in fields {
-                field(column.child(), label, |mut ui| {
-                    ui.insert(Text::new(&value).style(style(14.0, colors::TEXT)));
+                // A position opens on Google Maps
+                let position = match label {
+                    "GPS start" => dive.start_position,
+                    "GPS end" => dive.end_position,
+                    _ => None,
+                };
+                field(column.child(), label, |mut ui| match position {
+                    Some(at) => {
+                        if link(ui, Id::new(("link", label)), &value) {
+                            open = Some(maps_url(at));
+                        }
+                    }
+                    None => {
+                        ui.insert(Text::new(&value).style(style(14.0, colors::TEXT)));
+                    }
                 });
             }
         }
@@ -868,7 +890,86 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) -> Option<C
         });
     }
 
-    ignore.then_some(Choice::Key('i'))
+    match ignore {
+        true => Some(Choice::Key('i')),
+        false => open.map(Choice::Open),
+    }
+}
+
+/// A map pin, then `text`, that light up under the pointer. Returns
+/// whether it was clicked.
+fn link(ui: Ui<'_>, id: Id, text: &str) -> bool {
+    let mut row = ui.layout(flex::row());
+    row.child().id(id).build(|ui: Ui<'_>| {
+        let mut link = ui.layout(flex::row().gap(6.0).align(Align::Center));
+        let press = link.interact(interact::press());
+        let color = if press.hovered {
+            colors::TEXT
+        } else {
+            colors::LINK
+        };
+        link.child().insert(Pin(color));
+        link.child()
+            .insert(Text::new(text).style(style(14.0, color)));
+        press.clicked
+    })
+}
+
+/// A map pin, as tall as a line of text.
+struct Pin(Color);
+
+impl<C: blit_gui::Context> Atom<C> for Pin {
+    fn measure(&self, _: &mut AtomCx<'_, C>, constraints: Constraints<f32>) -> Size<f32> {
+        constraints.constrain(Size::new(10.0, 14.0))
+    }
+
+    fn paint(&self, cx: &mut AtomCx<'_, C>, area: LogicalRect) {
+        let gui = cx.context_mut().as_mut();
+        let (x, y, radius) = (area.x + area.width / 2.0, area.y + 5.0, 5.0);
+        // The point below the head, then the head with a hole
+        let point = [
+            MeshVertex::new(x - radius * 0.8, y + radius * 0.6, self.0),
+            MeshVertex::new(x + radius * 0.8, y + radius * 0.6, self.0),
+            MeshVertex::new(x, area.y + 14.0, self.0),
+        ];
+        gui.paint_mesh(Mesh {
+            vertices: &point,
+            indices: &[0, 1, 2],
+        });
+        let disc = |radius: f32, color: Color| {
+            DrawRectangle::new(LogicalRect::new(
+                x - radius,
+                y - radius,
+                radius * 2.0,
+                radius * 2.0,
+            ))
+            .background(color)
+            .radius(BorderRadius::uniform(radius))
+        };
+        gui.paint_rectangle(disc(radius, self.0));
+        gui.paint_rectangle(disc(1.8, colors::PANEL));
+    }
+}
+
+/// Open a page in the browser of the desktop, rather than in the window.
+fn open_in_browser(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let child = std::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match child {
+        // Waited for aside: the window goes on meanwhile
+        Ok(mut child) => {
+            std::thread::spawn(move || child.wait());
+        }
+        Err(error) => eprintln!("Could not open {url} with {opener}: {error}"),
+    }
 }
 
 /// A label, then what `value` builds beside it.
@@ -1397,6 +1498,38 @@ mod tests {
 
     fn app() -> App {
         App::new(Logbook::new(PathBuf::new(), dives()))
+    }
+
+    #[test]
+    fn a_click_on_a_position_opens_google_maps() {
+        thread_local! {
+            static OPENED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        }
+        fn record(url: &str) {
+            OPENED.with_borrow_mut(|opened| opened.push(url.to_string()));
+        }
+
+        let mut dives = dives();
+        for dive in &mut dives {
+            dive.end_position = Some(crate::types::Position {
+                lat: 35.86868,
+                lon: 14.35122,
+            });
+        }
+        let mut app = App::new(Logbook::new(PathBuf::new(), dives));
+        app.open_url = record;
+
+        let link = area(&mut app, Id::new(("link", "GPS end")));
+        render(&mut app, &click(link));
+        assert_eq!(
+            OPENED.take(),
+            ["https://www.google.com/maps/search/?api=1&query=35.86868,14.35122"]
+        );
+        // No position at the start of these dives
+        assert!(render(&mut app, &[])
+            .0
+            .area(Id::new(("link", "GPS start")))
+            .is_none());
     }
 
     #[test]
