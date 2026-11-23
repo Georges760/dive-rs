@@ -306,30 +306,34 @@ impl App {
             });
         }
 
-        if let Some(pressure) = profile.pressure.filter(|_| self.show_pressure) {
-            legend.push((
-                format!(" ━ Press ({:.0}-{:.0}bar)", pressure.max, pressure.min),
-                Color::GREEN,
-            ));
-            series.push(Series {
-                points: pressure.points,
-                color: Color::GREEN,
-            });
-        }
-        // The second tank of a sidemount pair, "~" when estimated
-        if let Some(pressure) = profile.pressure2.filter(|_| self.show_pressure) {
-            let about = if pressure.estimated { "~" } else { "" };
-            legend.push((
-                format!(
-                    " ━ Press 2 ({about}{:.0}-{:.0}bar)",
-                    pressure.max, pressure.min
-                ),
-                Color::LIGHT_GREEN,
-            ));
-            series.push(Series {
-                points: pressure.points,
-                color: Color::LIGHT_GREEN,
-            });
+        // With the second tank of a sidemount pair: their total as "Press",
+        // then each tank, "~" when estimated. Backwards here, as the legend
+        // reads from the end, the total drawn last to stay on top.
+        if self.show_pressure {
+            let pair = profile.pressure2.is_some();
+            let first = match pair {
+                true => ("Press 1", Color::LIGHT_GREEN),
+                false => ("Press", Color::GREEN),
+            };
+            let curves = [
+                (profile.pressure2, ("Press 2", Color::LIGHT_YELLOW)),
+                (profile.pressure, first),
+                (profile.total_pressure, ("Press", Color::GREEN)),
+            ];
+            for (curve, (name, color)) in curves {
+                let Some(curve) = curve else {
+                    continue;
+                };
+                let about = if curve.estimated { "~" } else { "" };
+                legend.push((
+                    format!(" ━ {name} ({about}{:.0}-{:.0}bar)", curve.max, curve.min),
+                    color,
+                ));
+                series.push(Series {
+                    points: curve.points,
+                    color,
+                });
+            }
         }
 
         if self.show_depth {
@@ -1061,15 +1065,18 @@ mod tests {
         dive.samples[2].pressure2_bar = Some(180.0);
         let mut app = App::new(PathBuf::new(), vec![dive]);
 
-        let text = screen(&mut app, 160, 36);
+        let text = screen(&mut app, 200, 36);
         row_of(&text, "Pressure:  209 -> 99, ~209 -> 120 bar");
-        // Its curve, next to that of the transmitter
-        row_of(&text, "━ Press 2 (~205-180bar) ━ Press (190-190bar)");
+        // Their total, then each tank
+        row_of(
+            &text,
+            "━ Press (~395-370bar) ━ Press 1 (190-190bar) ━ Press 2 (~205-180bar)",
+        );
 
         app.cursor.set(Some((0, 1)));
         row_of(
             &screen(&mut app, 120, 36),
-            "00:05 (16:03:05)  25.6 m  190 / ~205 bar  25.4 C",
+            "00:05 (16:03:05)  25.6 m  190 + ~205 = ~395 bar  25.4 C",
         );
     }
 

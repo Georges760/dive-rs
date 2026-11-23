@@ -330,11 +330,17 @@ pub fn second_tank_estimated(dive: &DiveLog) -> bool {
 /// a sample.
 pub fn sample_values(dive: &DiveLog, sample: &Sample) -> [String; 4] {
     let bar = |pressure: Option<f64>| pressure.map_or("-".to_string(), |p| format!("{p:.0}"));
+    // With a second tank: each tank, then their total
     let pressure = match sample.pressure2_bar {
         Some(_) => {
             let about = if second_tank_estimated(dive) { "~" } else { "" };
             let (first, second) = (bar(sample.pressure_bar), bar(sample.pressure2_bar));
-            format!("{first} / {about}{second} bar")
+            // The total as the chart draws it
+            let index = dive.samples.iter().position(|s| std::ptr::eq(s, sample));
+            match index.and_then(|index| total_pressures(&dive.samples)[index]) {
+                Some(total) => format!("{first} + {about}{second} = {about}{total:.0} bar"),
+                None => format!("{first} + {about}{second} bar"),
+            }
         }
         None => format!("{} bar", bar(sample.pressure_bar)),
     };
@@ -426,6 +432,33 @@ pub struct Profile {
     pub pressure: Option<Overlay>,
     /// The second tank of a sidemount pair, on the scale of the first
     pub pressure2: Option<Overlay>,
+    /// Both tanks added up, when there is a second one
+    pub total_pressure: Option<Overlay>,
+}
+
+/// The pressures of both tanks added up at each sample where either has
+/// one. A tank without a reading there counts its nearest one before, or
+/// its first one at the start: it is not breathed until then.
+pub fn total_pressures(samples: &[Sample]) -> Vec<Option<f64>> {
+    let held = |value: fn(&Sample) -> Option<f64>| {
+        let mut last = samples.iter().find_map(value);
+        samples
+            .iter()
+            .map(|sample| {
+                last = value(sample).or(last);
+                last
+            })
+            .collect::<Vec<_>>()
+    };
+    let (first, second) = (held(|s| s.pressure_bar), held(|s| s.pressure2_bar));
+    samples
+        .iter()
+        .zip(first.into_iter().zip(second))
+        .map(|(sample, (first, second))| {
+            let read = sample.pressure_bar.is_some() || sample.pressure2_bar.is_some();
+            first.zip(second).filter(|_| read).map(|(a, b)| a + b)
+        })
+        .collect()
 }
 
 /// A curve with a range of its own, stretched over the depth axis, its
@@ -446,17 +479,22 @@ impl Profile {
         let time_bound = ((max_time / 5.0).ceil() * 5.0).max(5.0);
         let depth_bound = ((max_depth / 5.0).ceil() * 5.0).max(5.0);
 
-        let values = |value: fn(&Sample) -> Option<f64>| dive.samples.iter().filter_map(value);
-        // The curve of some values, `low` to `high` over the depth axis
-        let overlay = |value: fn(&Sample) -> Option<f64>, (low, high): (f64, f64)| {
-            values(value).next()?;
-            let (min, max) = range(values(value));
+        let column = |value: fn(&Sample) -> Option<f64>| -> Vec<Option<f64>> {
+            dive.samples.iter().map(value).collect()
+        };
+        let known = |values: &[Option<f64>]| range(values.iter().flatten().copied());
+        // The curve of some values, one per sample, `low` to `high` over the
+        // depth axis
+        let overlay = |values: &[Option<f64>], (low, high): (f64, f64)| {
+            values.iter().flatten().next()?;
+            let (min, max) = known(values);
             let span = (high - low).max(1.0);
             let points = dive
                 .samples
                 .iter()
-                .filter_map(|s| {
-                    value(s).map(|v| {
+                .zip(values)
+                .filter_map(|(s, value)| {
+                    value.map(|v| {
                         (
                             s.time_s as f32 / 60.0,
                             ((high - v) / span * depth_bound) as f32,
@@ -471,12 +509,21 @@ impl Profile {
                 estimated: false,
             })
         };
-        // Both tanks on one scale, to compare them
-        let pressures = range(values(|s| s.pressure_bar).chain(values(|s| s.pressure2_bar)));
-        let mut pressure2 = overlay(|s| s.pressure2_bar, pressures);
-        if let Some(curve) = &mut pressure2 {
+
+        // Both tanks and their total on one scale, to compare them
+        let first = column(|s| s.pressure_bar);
+        let second = column(|s| s.pressure2_bar);
+        let total = match second.iter().any(Option::is_some) {
+            true => total_pressures(&dive.samples),
+            false => Vec::new(),
+        };
+        let pressures = known(&[first.as_slice(), &second, &total].concat());
+        let (mut pressure2, mut total_pressure) =
+            (overlay(&second, pressures), overlay(&total, pressures));
+        for curve in [&mut pressure2, &mut total_pressure].into_iter().flatten() {
             curve.estimated = second_tank_estimated(dive);
         }
+        let temp = column(|s| s.temp_c);
 
         Self {
             time_bound,
@@ -486,9 +533,10 @@ impl Profile {
                 .iter()
                 .map(|s| (s.time_s as f32 / 60.0, s.depth_m as f32))
                 .collect(),
-            temp: overlay(|s| s.temp_c, range(values(|s| s.temp_c))),
-            pressure: overlay(|s| s.pressure_bar, pressures),
+            temp: overlay(&temp, known(&temp)),
+            pressure: overlay(&first, pressures),
             pressure2,
+            total_pressure,
         }
     }
 }
@@ -581,29 +629,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn both_tanks_share_one_scale() {
+    fn both_tanks_and_their_total_share_one_scale() {
         let sample = |time_s, depth_m, first, second| Sample {
             time_s,
             depth_m,
-            pressure_bar: Some(first),
+            pressure_bar: first,
             pressure2_bar: Some(second),
             ..Default::default()
         };
         let dive = DiveLog {
             samples: vec![
-                sample(0, 0.0, 200.0, 150.0),
-                sample(600, 20.0, 100.0, 120.0),
+                sample(0, 0.0, Some(200.0), 150.0),
+                sample(300, 30.0, None, 100.0),
+                sample(600, 30.0, Some(100.0), 50.0),
             ],
             ..Default::default()
         };
 
         let profile = Profile::new(&dive);
-        let (first, second) = (profile.pressure.unwrap(), profile.pressure2.unwrap());
-        // 200 bar at the top of the chart, 100 bar at the bottom, at 20 m
-        assert_eq!(first.points, [(0.0, 0.0), (10.0, 20.0)]);
-        assert_eq!(second.points, [(0.0, 10.0), (10.0, 16.0)]);
-        // Each curve keeps its own range for its label
-        assert_eq!((second.min, second.max), (120.0, 150.0));
-        assert!(!second.estimated);
+        let first = profile.pressure.unwrap();
+        let second = profile.pressure2.unwrap();
+        let total = profile.total_pressure.unwrap();
+        // 350 bar at the top of the chart, 50 bar at the bottom, at 30 m
+        assert_eq!(total.points, [(0.0, 0.0), (5.0, 5.0), (10.0, 20.0)]);
+        assert_eq!(first.points, [(0.0, 15.0), (10.0, 25.0)]);
+        assert_eq!(second.points, [(0.0, 20.0), (5.0, 25.0), (10.0, 30.0)]);
+        // Each curve keeps its own range for its label; without a reading,
+        // the first tank counts its last one in the total
+        assert_eq!((total.min, total.max), (150.0, 350.0));
+        assert_eq!((second.min, second.max), (50.0, 150.0));
+        assert!(!total.estimated && !second.estimated);
     }
 }

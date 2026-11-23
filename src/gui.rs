@@ -24,7 +24,7 @@ use crate::stats::{stats, Period, Stats};
 use crate::types::{DiveLog, DiveMode};
 use crate::viewer::{
     alarm_text, computer_numbers, dip_rows, dive_fields, hours, mode_short, nearest_sample, range,
-    sample_readout, sample_values, stats_summary, tissue_range, Logbook, Profile,
+    sample_readout, sample_values, stats_summary, tissue_range, Logbook, Overlay, Profile,
 };
 
 /// Deep water, bright curves.
@@ -42,8 +42,9 @@ mod colors {
     pub const DEPTH: Color = Color::rgb(76, 201, 240);
     pub const TEMP: Color = Color::rgb(255, 107, 107);
     pub const PRESSURE: Color = Color::rgb(105, 219, 124);
-    /// The second tank of a sidemount pair
-    pub const PRESSURE2: Color = Color::rgb(192, 235, 117);
+    /// Each tank of a sidemount pair, PRESSURE being their total
+    pub const PRESSURE1: Color = Color::rgb(192, 235, 117);
+    pub const PRESSURE2: Color = Color::rgb(255, 236, 153);
     pub const TIME: Color = Color::rgb(255, 209, 102);
     pub const ALARM: Color = Color::rgb(247, 131, 172);
     pub const SCUBA: Color = Color::rgb(255, 209, 102);
@@ -508,16 +509,31 @@ impl App {
                 let label = format!("Temp {:.0}-{:.0} C", temp.min, temp.max);
                 curves.push((vec![(label, colors::TEMP)], 't', self.show_temp));
             }
-            if let Some(pressure) = &profile.pressure {
-                let label = format!("Pressure {:.0}-{:.0} bar", pressure.max, pressure.min);
-                let mut tanks = vec![(label, colors::PRESSURE)];
-                // The second tank of a sidemount pair, "~" when estimated
-                if let Some(second) = &profile.pressure2 {
-                    let about = if second.estimated { "~" } else { "" };
-                    let label = format!("{about}{:.0}-{:.0} bar", second.max, second.min);
-                    tanks.push((label, colors::PRESSURE2));
+            let span = |curve: &Overlay| {
+                let about = if curve.estimated { "~" } else { "" };
+                format!("{about}{:.0}-{:.0}", curve.max, curve.min)
+            };
+            let pressures = match (&profile.total_pressure, &profile.pressure) {
+                // A sidemount pair: their total, then each tank
+                (Some(total), first) => {
+                    let mut labels =
+                        vec![(format!("Pressure {} bar", span(total)), colors::PRESSURE)];
+                    if let Some(first) = first {
+                        labels.push((format!("1: {}", span(first)), colors::PRESSURE1));
+                    }
+                    if let Some(second) = &profile.pressure2 {
+                        labels.push((format!("2: {} bar", span(second)), colors::PRESSURE2));
+                    }
+                    Some(labels)
                 }
-                curves.push((tanks, 'p', self.show_pressure));
+                (None, Some(first)) => Some(vec![(
+                    format!("Pressure {} bar", span(first)),
+                    colors::PRESSURE,
+                )]),
+                (None, None) => None,
+            };
+            if let Some(labels) = pressures {
+                curves.push((labels, 'p', self.show_pressure));
             }
             for (labels, key, on) in curves {
                 let clicked = header
@@ -579,11 +595,22 @@ impl App {
         if let Some(temp) = profile.temp.filter(|_| self.show_temp) {
             curves.push((temp.points, colors::TEMP));
         }
-        if let Some(pressure) = profile.pressure.filter(|_| self.show_pressure) {
-            curves.push((pressure.points, colors::PRESSURE));
-        }
-        if let Some(pressure) = profile.pressure2.filter(|_| self.show_pressure) {
-            curves.push((pressure.points, colors::PRESSURE2));
+        if self.show_pressure {
+            // A sidemount pair: each tank, then their total on top
+            let first = match profile.pressure2.is_some() {
+                true => colors::PRESSURE1,
+                false => colors::PRESSURE,
+            };
+            let pressures = [
+                (profile.pressure2, colors::PRESSURE2),
+                (profile.pressure, first),
+                (profile.total_pressure, colors::PRESSURE),
+            ];
+            for (curve, color) in pressures {
+                if let Some(curve) = curve {
+                    curves.push((curve.points, color));
+                }
+            }
         }
         let depth = self.show_depth.then_some(profile.depth);
         let cursor = picked.map(|sample| (sample.time_s as f32 / 60.0, sample.depth_m as f32));
