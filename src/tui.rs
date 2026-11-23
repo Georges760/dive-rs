@@ -2,7 +2,10 @@ use std::cell::Cell as StateCell;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use blit::{Atom, AtomCx, Constraints, Id, Input, Key, PhysicalRect, Sides, Size, Sizing};
+use blit::{
+    AnimationOptions, Atom, AtomCx, Constraints, Id, Input, Key, PhysicalRect, Sides, Size, Sizing,
+    Tween,
+};
 use blit_tui::atom::{Border, TitlePosition};
 use blit_tui::cell::{Cell, CellStyle};
 use blit_tui::color::Color;
@@ -11,28 +14,19 @@ use blit_tui::text::{Span, TextAttributes, TextOptions, TextOverflow, TextWrap};
 use blit_tui::widget::{Block, ScrollState, Text, Title, UniformList};
 use blit_tui::{interact, BoundsClip, TuiContext, Ui};
 
-use crate::stats::{sac_l_min, stats, Period, Stats};
-use crate::types::{logbook_numbers, DiveData, DiveLog, DiveMode, SafetyStop, Sample, Water};
+use crate::stats::{stats, Period, Stats};
+use crate::types::{DiveLog, DiveMode};
+use crate::viewer::{
+    alarm_text, computer_numbers, dip_rows, dive_fields, hours, mode_short, nearest_sample, range,
+    sample_readout, sample_values, stats_summary, tissue_range, Logbook, Profile,
+};
 
 struct App {
-    /// The file the dives come from, written back when one is ignored
-    path: PathBuf,
-    /// The dives, in the order of the file
-    dives: Vec<DiveLog>,
-    /// Number of each dive in the logbook; none for an ignored dive
-    numbers: Vec<Option<u32>>,
-    /// Indexes of the dives in the list, most recent first
-    listed: Vec<usize>,
-    /// Row of the list that is selected
-    selected: usize,
+    logbook: Logbook,
     scroll: ScrollState,
     show_depth: bool,
     show_temp: bool,
     show_pressure: bool,
-    /// Whether the list has the ignored dives too
-    show_ignored: bool,
-    /// What went wrong when the file was last written
-    error: Option<String>,
     /// The figures of the statistics page, while it is the one shown
     stats: Option<Stats>,
     /// Sample picked on the chart, as (dive index, sample index). Set while
@@ -42,79 +36,15 @@ struct App {
 
 impl App {
     fn new(path: PathBuf, dives: Vec<DiveLog>) -> Self {
-        let mut app = Self {
-            path,
-            dives,
-            numbers: Vec::new(),
-            listed: Vec::new(),
-            selected: 0,
+        Self {
+            logbook: Logbook::new(path, dives),
             scroll: ScrollState::new(),
             show_depth: true,
             show_temp: true,
             show_pressure: true,
-            show_ignored: false,
-            error: None,
             stats: None,
             cursor: StateCell::new(None),
-        };
-        app.list_dives(None);
-        app
-    }
-
-    /// Index of the selected dive, if the list has any.
-    fn current(&self) -> Option<usize> {
-        self.listed.get(self.selected).copied()
-    }
-
-    /// Rebuild the list: latest dive first, without the ignored ones
-    /// unless they are asked for. `keep` is the dive to leave selected; when
-    /// it is no longer listed, the selection stays on its row.
-    fn list_dives(&mut self, keep: Option<usize>) {
-        self.numbers = logbook_numbers(&self.dives);
-        self.listed = (0..self.dives.len())
-            .filter(|&dive| self.show_ignored || !self.dives[dive].ignored)
-            .collect();
-        // By date, as the dives are numbered
-        self.listed.sort_by_key(|&dive| {
-            let dive = &self.dives[dive];
-            std::cmp::Reverse((dive.datetime, dive.number))
-        });
-
-        let row = keep.and_then(|keep| self.listed.iter().position(|&dive| dive == keep));
-        self.selected = row
-            .unwrap_or(self.selected)
-            .min(self.listed.len().saturating_sub(1));
-        self.scroll_to_selected();
-    }
-
-    /// Ignore the selected dive, or take it back, and write the file.
-    fn toggle_ignored(&mut self) {
-        let Some(dive) = self.current() else {
-            return;
-        };
-        self.dives[dive].ignored = !self.dives[dive].ignored;
-        self.error = self.save().err().map(|error| format!("{error:#}"));
-        if self.error.is_some() {
-            // Not written: do not show what the file does not hold
-            self.dives[dive].ignored = !self.dives[dive].ignored;
         }
-        self.list_dives(Some(dive));
-    }
-
-    /// Write the dives back to the file they were read from.
-    fn save(&mut self) -> Result<()> {
-        let data = DiveData {
-            dives: std::mem::take(&mut self.dives),
-        };
-        let json = serde_json::to_string_pretty(&data);
-        self.dives = data.dives;
-
-        // Through a temporary file: an interrupted write must not cost the log
-        let mut temporary = self.path.clone().into_os_string();
-        temporary.push(".tmp");
-        std::fs::write(&temporary, json?)
-            .and_then(|()| std::fs::rename(&temporary, &self.path))
-            .with_context(|| format!("Failed to write {}", self.path.display()))
     }
 
     /// Apply one input event. Returns true when the user asked to quit.
@@ -130,34 +60,32 @@ impl App {
             return false;
         }
 
-        let last = self.listed.len().saturating_sub(1);
-        let previous = self.selected;
+        let logbook = &mut self.logbook;
+        let last = logbook.last_row();
+        let previous = (logbook.selected, logbook.listed.len());
 
         match input {
             Input::Text('q') => return true,
-            Input::Text('s') => self.stats = Some(stats(&self.dives)),
-            Input::Text('i') => self.toggle_ignored(),
-            Input::Text('a') => {
-                self.show_ignored = !self.show_ignored;
-                self.list_dives(self.current());
-            }
+            Input::Text('s') => self.stats = Some(stats(&logbook.dives)),
+            Input::Text('i') => logbook.toggle_ignored(),
+            Input::Text('a') => logbook.toggle_show_ignored(),
             Input::Text('d') => self.show_depth = !self.show_depth,
             Input::Text('t') => self.show_temp = !self.show_temp,
             Input::Text('p') => self.show_pressure = !self.show_pressure,
-            Input::Text('j') => self.selected = (self.selected + 1).min(last),
-            Input::Text('k') => self.selected = self.selected.saturating_sub(1),
+            Input::Text('j') => logbook.selected = (logbook.selected + 1).min(last),
+            Input::Text('k') => logbook.selected = logbook.selected.saturating_sub(1),
             Input::Key(key) if key.pressed => match key.key {
                 Key::Escape => return true,
-                Key::ArrowDown => self.selected = (self.selected + 1).min(last),
-                Key::ArrowUp => self.selected = self.selected.saturating_sub(1),
-                Key::Home => self.selected = 0,
-                Key::End => self.selected = last,
+                Key::ArrowDown => logbook.selected = (logbook.selected + 1).min(last),
+                Key::ArrowUp => logbook.selected = logbook.selected.saturating_sub(1),
+                Key::Home => logbook.selected = 0,
+                Key::End => logbook.selected = last,
                 _ => {}
             },
             _ => {}
         }
 
-        if self.selected != previous {
+        if (self.logbook.selected, self.logbook.listed.len()) != previous {
             self.scroll_to_selected();
         }
         false
@@ -165,12 +93,14 @@ impl App {
 
     /// Keep the selected row inside the list viewport (rows are one cell high).
     fn scroll_to_selected(&mut self) {
-        let row = self.selected as i32;
+        let row = self.logbook.selected as i32;
         let visible = self.scroll.viewport_extent;
         if row < self.scroll.offset {
-            self.scroll.scroll_to(row, None);
+            self.scroll
+                .scroll_to(row, Tween::default(), AnimationOptions::new());
         } else if visible > 0 && row + 1 > self.scroll.offset + visible {
-            self.scroll.scroll_to(row + 1 - visible, None);
+            self.scroll
+                .scroll_to(row + 1 - visible, Tween::default(), AnimationOptions::new());
         }
     }
 
@@ -200,8 +130,8 @@ impl App {
     }
 
     fn render_dive_list(&mut self, ui: Ui<'_>) {
-        let ignored = self.dives.iter().filter(|dive| dive.ignored).count();
-        let hint = match (self.show_ignored, ignored) {
+        let logbook = &mut self.logbook;
+        let hint = match (logbook.show_ignored, logbook.ignored()) {
             (true, _) => " i ignore  a hide ignored ".to_string(),
             (false, 0) => " i ignore ".to_string(),
             (false, count) => format!(" i ignore  a show {count} ignored "),
@@ -216,15 +146,16 @@ impl App {
             ),
         );
 
-        let selected = self.selected;
-        let numbers = &self.numbers;
+        let selected = logbook.selected;
+        let numbers = &logbook.numbers;
         let mut clicked = None;
         panel.child().item(flex::item().grow()).build(
             UniformList::new(
                 &mut self.scroll,
-                self.listed
+                logbook
+                    .listed
                     .iter()
-                    .map(|&dive| (dive, &self.dives[dive]))
+                    .map(|&dive| (dive, &logbook.dives[dive]))
                     .enumerate(),
             )
             .id(|_, _, (_, (dive, _)): &(usize, (usize, &DiveLog))| Id::new(("dive", *dive)))
@@ -274,7 +205,7 @@ impl App {
         );
 
         // Under the list, over as many lines as it takes
-        if let Some(error) = &self.error {
+        if let Some(error) = &logbook.error {
             panel
                 .child()
                 .item(flex::item().width(Sizing::grow()).height(Sizing::fit()))
@@ -286,12 +217,12 @@ impl App {
         }
 
         if let Some(index) = clicked {
-            self.selected = index;
+            logbook.selected = index;
         }
     }
 
     fn render_detail_panel(&self, ui: Ui<'_>) {
-        let Some(index) = self.current() else {
+        let Some(index) = self.logbook.current() else {
             let mut panel = ui.layout(flex::column().padding(Sides::all(1)));
             panel.insert(panel_block(" Dive Details "));
             panel
@@ -299,13 +230,13 @@ impl App {
                 .insert(Text::new(" Every dive is ignored: press a to list them"));
             return;
         };
-        let dive = &self.dives[index];
+        let dive = &self.logbook.dives[index];
 
         let mut column = ui.layout(flex::column());
         column
             .child()
             .item(flex::item().width(Sizing::grow()).height(Sizing::fit()))
-            .build(|ui: Ui<'_>| render_dive_info(ui, dive, self.numbers[index]));
+            .build(|ui: Ui<'_>| render_dive_info(ui, dive, self.logbook.numbers[index]));
         column
             .child()
             .item(flex::item().grow())
@@ -333,16 +264,7 @@ impl App {
             return;
         }
 
-        let max_time = dive.samples.iter().map(|s| s.time_s).max().unwrap_or(0) as f32 / 60.0;
-        let max_depth = dive
-            .samples
-            .iter()
-            .map(|s| s.depth_m)
-            .fold(0.0_f64, f64::max);
-
-        // Round up axis bounds for nice labels
-        let time_bound = ((max_time / 5.0).ceil() * 5.0).max(5.0);
-        let depth_bound = ((max_depth / 5.0).ceil() * 5.0).max(5.0);
+        let profile = Profile::new(dive);
 
         // Pressing or dragging on the chart picks the sample under the pointer.
         // Done before the legend row is built so its readout is not a frame late.
@@ -352,21 +274,13 @@ impl App {
         let pressed = panel.interact_widget(chart_id, interact::press()).active;
         let dragged = panel.interact_widget(chart_id, interact::drag()).active;
         if pressed || dragged {
-            if let (Some(area), Some(pointer)) = (area, panel.pointer_position()) {
+            if let (Some(area), Some(pointer)) = (area, panel.mouse_position()) {
                 let plot_x = (area.x + LineChart::GUTTER as i32) as f32;
                 let plot_width = (area.width - LineChart::GUTTER as i32).max(1) as f32;
-                let time_s =
-                    ((pointer.x as f32 - plot_x) / plot_width).clamp(0.0, 1.0) * time_bound * 60.0;
-                let nearest = dive
-                    .samples
-                    .iter()
-                    .enumerate()
-                    .min_by(|(_, a), (_, b)| {
-                        let distance = |s: &crate::types::Sample| (s.time_s as f32 - time_s).abs();
-                        distance(a).total_cmp(&distance(b))
-                    })
-                    .map(|(index, _)| index);
-                if let Some(sample) = nearest {
+                let time_s = ((pointer.x as f32 - plot_x) / plot_width).clamp(0.0, 1.0)
+                    * profile.time_bound
+                    * 60.0;
+                if let Some(sample) = nearest_sample(dive, time_s) {
                     self.cursor.set(Some((index, sample)));
                 }
             }
@@ -379,58 +293,33 @@ impl App {
         let mut series = Vec::new();
         let mut legend = Vec::new();
 
-        // Temperature and pressure share the depth axis: their own range is
-        // stretched over it, highest value at the top. Drawn first so the
+        // Temperature and pressure share the depth axis. Drawn first so the
         // depth curve stays on top.
-        let overlay = |value: fn(&crate::types::Sample) -> Option<f64>| {
-            let (min, max) = dive
-                .samples
-                .iter()
-                .filter_map(value)
-                .fold((f64::MAX, f64::MIN), |(min, max), v| {
-                    (min.min(v), max.max(v))
-                });
-            let range = (max - min).max(1.0);
-            let points: Vec<(f32, f32)> = dive
-                .samples
-                .iter()
-                .filter_map(|s| {
-                    value(s).map(|v| {
-                        (
-                            s.time_s as f32 / 60.0,
-                            ((max - v) / range * depth_bound) as f32,
-                        )
-                    })
-                })
-                .collect();
-            (points, min, max)
-        };
-
-        if self.show_temp && dive.samples.iter().any(|s| s.temp_c.is_some()) {
-            let (points, min, max) = overlay(|s| s.temp_c);
+        if let Some(temp) = profile.temp.filter(|_| self.show_temp) {
+            legend.push((
+                format!(" ━ Temp ({:.0}-{:.0}C)", temp.min, temp.max),
+                Color::RED,
+            ));
             series.push(Series {
-                points,
+                points: temp.points,
                 color: Color::RED,
             });
-            legend.push((format!(" ━ Temp ({min:.0}-{max:.0}C)"), Color::RED));
         }
 
-        if self.show_pressure && dive.samples.iter().any(|s| s.pressure_bar.is_some()) {
-            let (points, min, max) = overlay(|s| s.pressure_bar);
+        if let Some(pressure) = profile.pressure.filter(|_| self.show_pressure) {
+            legend.push((
+                format!(" ━ Press ({:.0}-{:.0}bar)", pressure.max, pressure.min),
+                Color::GREEN,
+            ));
             series.push(Series {
-                points,
+                points: pressure.points,
                 color: Color::GREEN,
             });
-            legend.push((format!(" ━ Press ({max:.0}-{min:.0}bar)"), Color::GREEN));
         }
 
         if self.show_depth {
             series.push(Series {
-                points: dive
-                    .samples
-                    .iter()
-                    .map(|s| (s.time_s as f32 / 60.0, s.depth_m as f32))
-                    .collect(),
+                points: profile.depth,
                 color: Color::CYAN,
             });
             legend.push((" ━ Depth".to_string(), Color::CYAN));
@@ -442,34 +331,14 @@ impl App {
             .map(|(label, color)| Span::new(label).color(*color))
             .collect();
         let readout: Vec<(String, Color)> = match picked {
-            Some(sample) => vec![
-                (
-                    // Time into the dive, then the time of day
-                    format!(
-                        "{:02}:{:02} ({})  ",
-                        sample.time_s / 60,
-                        sample.time_s % 60,
-                        (dive.datetime + chrono::Duration::seconds(sample.time_s as i64))
-                            .format("%H:%M:%S"),
-                    ),
-                    Color::YELLOW,
-                ),
-                (format!("{:.1} m  ", sample.depth_m), Color::CYAN),
-                (
-                    sample
-                        .pressure_bar
-                        .map_or("- bar  ".to_string(), |p| format!("{p:.0} bar  ")),
-                    Color::GREEN,
-                ),
-                (
-                    sample
-                        .temp_c
-                        .map_or("- C ".to_string(), |t| format!("{t:.1} C ")),
-                    Color::RED,
-                ),
-            ],
+            // Time into the dive, then the time of day
+            Some(sample) => sample_values(dive, sample)
+                .into_iter()
+                .zip([Color::YELLOW, Color::CYAN, Color::GREEN, Color::RED])
+                .map(|(text, color)| (format!("{text}  "), color))
+                .collect(),
             None => vec![(
-                "click the chart to read values ".to_string(),
+                "click the chart to read values  ".to_string(),
                 Color::DARK_GRAY,
             )],
         };
@@ -501,6 +370,11 @@ impl App {
         // even with no sample picked, so that the chart does not move.
         if dive.samples[0].speed_m_min.is_some() {
             let [state, signals, alarms] = picked.map(sample_readout).unwrap_or_default();
+            let state = format!(" {state}");
+            let mut signals = format!(" {signals}");
+            if !alarms.is_empty() && signals.len() > 1 {
+                signals.push_str("  ");
+            }
             let row = || flex::item().width(Sizing::grow()).height(Sizing::fixed(1));
             panel
                 .child()
@@ -521,25 +395,19 @@ impl App {
             .id(chart_id)
             .insert(LineChart {
                 series,
-                x_max: time_bound,
-                y_max: depth_bound as f32,
+                x_max: profile.time_bound,
+                y_max: profile.depth_bound,
                 cursor: picked.map(|sample| sample.time_s as f32 / 60.0),
             });
     }
 }
 
 pub fn run(input: PathBuf) -> Result<()> {
-    let contents = std::fs::read_to_string(&input)
-        .with_context(|| format!("Failed to read {}", input.display()))?;
-    let data: DiveData = serde_json::from_str(&contents)
-        .with_context(|| format!("Failed to parse {}", input.display()))?;
-
-    if data.dives.is_empty() {
+    let Some(logbook) = Logbook::open(input.clone())? else {
         eprintln!("No dives found in {}", input.display());
         return Ok(());
-    }
-
-    let mut app = App::new(input, data.dives);
+    };
+    let mut app = App::new(logbook.path, logbook.dives);
 
     // blit owns the terminal: raw mode, alternate screen, keyboard and mouse.
     // It needs the kitty keyboard protocol (kitty, ghostty, ...).
@@ -557,16 +425,6 @@ fn number_color(mode: &DiveMode) -> Color {
     }
 }
 
-fn mode_short(mode: &DiveMode) -> &'static str {
-    match mode {
-        DiveMode::Air => "Air",
-        DiveMode::Nitrox => "Nx",
-        DiveMode::Gauge => "Gau",
-        DiveMode::Freedive => "Free",
-        DiveMode::Ccr => "CCR",
-    }
-}
-
 fn panel_block(title: &str) -> Block<'_> {
     Block::new()
         .border(Border::new(Color::Reset))
@@ -575,150 +433,12 @@ fn panel_block(title: &str) -> Block<'_> {
 
 /// `number` is that of the dive in the logbook.
 fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) {
-    let duration_min = dive.duration_seconds / 60;
-    let duration_sec = dive.duration_seconds % 60;
-
-    let gas_str = dive
-        .gas_mixes
-        .iter()
-        .map(|g| match g.he {
-            0 => format!("{}% O2", g.o2),
-            he => format!("{}% O2 {he}% He", g.o2),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    // Temperature range from the header, else from the samples, or from the
-    // dips of a freedive session
-    let (temp_min, temp_max) = match (dive.min_temp_c, dive.max_temp_c) {
-        (Some(min), Some(max)) => (min, max),
-        _ => dive
-            .samples
-            .iter()
-            .filter_map(|s| s.temp_c)
-            .chain(dive.dips.iter().filter_map(|d| d.min_temp_c))
-            .fold((f64::MAX, f64::MIN), |(min, max), t| {
-                (min.min(t), max.max(t))
-            }),
-    };
-
-    // Pressure: per tank from the header, else the first and last samples
-    let tanks: Vec<_> = dive
-        .gas_mixes
-        .iter()
-        .filter_map(|g| g.tank.as_ref())
-        .collect();
-    let pressure = if tanks.is_empty() {
-        let start = dive.samples.iter().find_map(|s| s.pressure_bar);
-        let end = dive.samples.iter().rev().find_map(|s| s.pressure_bar);
-        start
-            .zip(end)
-            .map(|(start, end)| format!("{start:.0} -> {end:.0} bar"))
-    } else {
-        Some(
-            tanks
-                .iter()
-                .map(|tank| format!("{:.0} -> {:.0} bar", tank.start_bar, tank.end_bar))
-                .collect::<Vec<_>>()
-                .join(", "),
-        )
-    };
-    let tank_sizes = tanks
-        .iter()
-        .filter_map(|tank| tank.volume_l.zip(tank.working_bar))
-        .map(|(volume, working)| format!("{volume} l, {working} bar"))
-        .collect::<Vec<_>>()
-        .join("; ");
-
-    let mut date = format!(" Date:      {}", dive.datetime.format("%Y-%m-%d %H:%M"));
-    if let Some(end) = dive.end_datetime {
-        date.push_str(&format!(" - {}", end.format("%H:%M")));
-    }
-    let mut depth = format!(" Max depth: {:.1} m", dive.max_depth_m);
-    if let Some(avg) = dive.avg_depth_m {
-        depth.push_str(&format!(" (avg {avg:.1} m)"));
-    }
-
-    let mut left_col: Vec<String> = vec![
-        date,
-        format!(" Duration:  {:02}:{:02}", duration_min, duration_sec),
-        depth,
-    ];
-
-    // A dive from a logbook has no gas to name
-    let mut right_col: Vec<String> = Vec::new();
-    if !dive.dips.is_empty() {
-        right_col.push(format!(" Dips:      {}", dive.dips.len()));
-    } else if !gas_str.is_empty() {
-        right_col.push(format!(" Gas:       {}", gas_str));
-    }
-
-    if temp_min != f64::MAX {
-        right_col.push(format!(" Temp:      {:.1} - {:.1} C", temp_min, temp_max));
-    }
-
-    if let Some(pressure) = pressure {
-        right_col.push(format!(" Pressure:  {pressure}"));
-    }
-
-    if let Some(ref site) = dive.site {
-        left_col.push(format!(" Site:      {}", site));
-    }
-    if let Some(ref country) = dive.country {
-        right_col.push(format!(" Country:   {}", country));
-    }
-    if let Some(ref buddy) = dive.buddy {
-        left_col.push(format!(" Buddy/Ctr: {}", buddy));
-    }
-
-    // 0 when the watch counts the dive as the first
-    if let Some(interval) = dive.surface_interval_s.filter(|&s| s > 0) {
-        left_col.push(format!(
-            " Surface:   {}:{:02} h since last dive",
-            interval / 3600,
-            interval % 3600 / 60
-        ));
-    }
-    let water = dive.water.map(|water| match water {
-        Water::Fresh => "fresh".to_string(),
-        Water::Salt => "salt".to_string(),
-        Water::En13319 => "EN 13319".to_string(),
+    let fields = dive_fields(dive).map(|fields| {
+        fields
+            .into_iter()
+            .map(|(label, value)| format!(" {:<11}{value}", format!("{label}:")))
+            .collect::<Vec<_>>()
     });
-    let atmospheric = dive.atmospheric_mbar.map(|mbar| format!("{mbar} mbar"));
-    if water.is_some() || atmospheric.is_some() {
-        let parts: Vec<String> = water.into_iter().chain(atmospheric).collect();
-        left_col.push(format!(" Water:     {}", parts.join(", ")));
-    }
-    if let (Some(start), Some(end)) = (dive.battery_start_pct, dive.battery_end_pct) {
-        left_col.push(format!(" Battery:   {start} -> {end} %"));
-    }
-
-    if !tank_sizes.is_empty() {
-        right_col.push(format!(" Tank:      {tank_sizes}"));
-    }
-    if let Some(sac) = sac_l_min(dive) {
-        right_col.push(format!(" Air:       {sac:.1} l/min at the surface"));
-    }
-    if let Some(start) = dive.start_position {
-        right_col.push(format!(" GPS:       {:.5}, {:.5}", start.lat, start.lon));
-    }
-    if !dive.gradient_factors.is_empty() {
-        let sets: Vec<String> = dive
-            .gradient_factors
-            .iter()
-            .map(|gf| format!("{}/{}", gf.low, gf.high))
-            .collect();
-        right_col.push(format!(" GF:        {}", sets.join(", ")));
-    }
-    if let (Some(start), Some(end)) = (dive.cns_start_pct, dive.cns_end_pct) {
-        right_col.push(format!(" CNS:       {start:.1} -> {end:.1} %"));
-    }
-    if let (Some(start), Some(end)) = (dive.otu_start, dive.otu_end) {
-        right_col.push(format!(" OTU:       {start:.1} -> {end:.1}"));
-    }
-    if let Some(speed) = dive.max_ascent_speed_m_min {
-        right_col.push(format!(" Ascent:    {speed:.1} m/min max"));
-    }
 
     let mut panel = ui.layout(flex::column().padding(Sides::all(1)));
     panel.insert(panel_block(" Dive Details "));
@@ -729,13 +449,10 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) {
         None => "  Dive  ".to_string(),
     };
     // The number the dive has on each computer, to find it there
-    let mut on_watch = match dive.number {
-        0 => String::new(),
-        number => format!("    watch #{number}"),
-    };
-    if let Some(number) = dive.dsx_number {
-        on_watch += &format!("    DSX #{number}");
-    }
+    let on_watch: String = computer_numbers(dive)
+        .iter()
+        .map(|number| format!("    {number}"))
+        .collect();
     let mode = format!("{:?}", dive.dive_mode);
     let count = if dive.dips.is_empty() {
         format!("    ({} samples)", dive.samples.len())
@@ -756,7 +473,7 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) {
     let fit = || flex::item().width(Sizing::grow()).height(Sizing::fit());
     {
         let mut columns = panel.child().item(fit()).layout(flex::row());
-        for lines in [&left_col, &right_col] {
+        for lines in &fields {
             let mut column = columns.child().item(fit()).layout(flex::column());
             for line in lines {
                 column.child().insert(Text::new(line));
@@ -766,7 +483,7 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) {
 
     // The alarms take the full width, and as many lines as they need
     if !dive.alarms.is_empty() {
-        let alarms = dive.alarms.join(", ").replace('_', " ");
+        let alarms = alarm_text(&dive.alarms);
         let mut row = panel.child().item(fit()).layout(flex::row());
         row.child().insert(Text::new(" Alarms:    "));
         row.child().item(fit()).insert(
@@ -781,20 +498,11 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) {
         if pressures.is_empty() {
             continue;
         }
-        let (min, max) = pressures
-            .iter()
-            .fold((f64::MAX, f64::MIN), |(min, max), &p| {
-                (min.min(p), max.max(p))
-            });
-        let range = if max > min {
-            format!("{min:.0}-{max:.0}")
-        } else {
-            format!("{min:.0}")
-        };
         panel.child().insert(Text::new(&format!(
-            " {:<11}{}  {gas} {range} mbar at the start",
+            " {:<11}{}  {gas} {} mbar at the start",
             if i == 0 { "Tissues:" } else { "" },
             tissue_bars(pressures),
+            tissue_range(pressures),
         )));
     }
 }
@@ -802,11 +510,7 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) {
 /// One bar per tissue compartment, from the least to the most loaded.
 fn tissue_bars(pressures: &[f64]) -> String {
     const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let (min, max) = pressures
-        .iter()
-        .fold((f64::MAX, f64::MIN), |(min, max), &p| {
-            (min.min(p), max.max(p))
-        });
+    let (min, max) = range(pressures.iter().copied());
     pressures
         .iter()
         .map(|&p| {
@@ -820,69 +524,6 @@ fn tissue_bars(pressures: &[f64]) -> String {
         .collect()
 }
 
-/// What the newer logs hold at a sample, as three pieces of text: where the
-/// dive stands, what the watch works out, and the alarms it raises.
-fn sample_readout(sample: &Sample) -> [String; 3] {
-    let mut state = Vec::new();
-    if let Some(speed) = sample.speed_m_min {
-        let arrow = match speed {
-            s if s > 0.0 => '↑',
-            s if s < 0.0 => '↓',
-            _ => '→',
-        };
-        state.push(format!("{arrow} {:.1} m/min", speed.abs()));
-    }
-    if let Some(ndl) = sample.ndl_min {
-        state.push(format!("NDL {ndl} min"));
-    }
-    if let Some(time) = sample.deco_time_min {
-        state.push(match sample.deco_stop_m {
-            Some(stop) => format!("deco {time} min at {stop} m"),
-            None => format!("deco {time} min"),
-        });
-    }
-    if let (Some(now), Some(surface)) = (sample.gf_pct, sample.surface_gf_pct) {
-        state.push(format!("GF {now:.0} %, surface {surface:.0} %"));
-    }
-    if let Some(ambient) = sample.ambient_mbar {
-        state.push(format!("{ambient} mbar"));
-    }
-
-    let mut signals = Vec::new();
-    if let Some(minutes) = sample.gas_time_min {
-        signals.push(format!("gas for {minutes} min"));
-    }
-    if let Some(sac) = sample.sac_l_min {
-        signals.push(format!("{sac} l/min"));
-    }
-    if let Some(stop) = sample.safety_stop {
-        signals.push(format!(
-            "safety stop {}",
-            match stop {
-                SafetyStop::Due => "due",
-                SafetyStop::Running => "running",
-                SafetyStop::Paused => "paused",
-            }
-        ));
-    }
-    if sample.gas > 0 {
-        signals.push(format!("mix {}", sample.gas + 1));
-    }
-    if sample.gf_set > 0 {
-        signals.push(format!("GF set {}", sample.gf_set + 1));
-    }
-    if sample.bookmark > 0 {
-        signals.push(format!("bookmark {}", sample.bookmark));
-    }
-
-    let mut signals = format!(" {}", signals.join("  "));
-    let alarms = sample.alarms.join(", ").replace('_', " ");
-    if !alarms.is_empty() && signals.len() > 1 {
-        signals.push_str("  ");
-    }
-    [format!(" {}", state.join("  ")), signals, alarms]
-}
-
 /// Freedive sessions have no depth samples: list the dips instead of a chart.
 fn render_dips_table(ui: Ui<'_>, dive: &DiveLog) {
     let mut panel = ui.layout(flex::column().padding(Sides::all(1)));
@@ -893,27 +534,10 @@ fn render_dips_table(ui: Ui<'_>, dive: &DiveLog) {
             .attributes(TextAttributes::BOLD),
     );
 
-    // Start times are rebuilt by adding up surface and dive times
-    let mut start_s = 0;
-    for (i, dip) in dive.dips.iter().enumerate() {
-        start_s += dip.surface_s;
-        let temp = dip
-            .min_temp_c
-            .map(|t| format!("{t:.1} C"))
-            .unwrap_or_default();
+    for [number, start, depth, time, surface, temp] in dip_rows(dive) {
         panel.child().insert(Text::new(&format!(
-            "  {:>2}  {:>3}:{:02}  {:>5.1} m  {:>2}:{:02}   {:>3}:{:02}   {:>6}",
-            i + 1,
-            start_s / 60,
-            start_s % 60,
-            dip.max_depth_m,
-            dip.duration_s / 60,
-            dip.duration_s % 60,
-            dip.surface_s / 60,
-            dip.surface_s % 60,
-            temp,
+            "  {number:>2}  {start:>6}  {depth:>7}  {time:>5}   {surface:>6}   {temp:>6}"
         )));
-        start_s += dip.duration_s;
     }
 }
 
@@ -938,10 +562,6 @@ fn country_color(stats: &Stats, country: usize) -> Color {
     }
 }
 
-fn hours(seconds: u64) -> String {
-    format!("{:.0} h", seconds as f64 / 3600.0)
-}
-
 /// The whole logbook in figures: totals, dives per year and per month of
 /// the year with a colour per country, air consumption month after month.
 fn render_stats(ui: Ui<'_>, stats: &Stats) {
@@ -962,43 +582,9 @@ fn render_stats(ui: Ui<'_>, stats: &Stats) {
             ),
         );
 
-        let named = stats.countries.iter().filter(|(name, _)| !name.is_empty());
-        panel.child().insert(Text::new(&format!(
-            " {} dives, {} freedive sessions, {} under water, {} sites, {} countries",
-            stats.dives,
-            stats.freedive_sessions,
-            hours(stats.time_s),
-            stats.sites.len(),
-            named.count(),
-        )));
-
-        let place = |site: &String| match site.as_str() {
-            "" => String::new(),
-            site => format!(", {site}"),
-        };
-        let mut records = Vec::new();
-        if let Some((depth, date, site)) = &stats.deepest {
-            records.push(format!("Deepest {depth:.1} m ({date}{})", place(site)));
+        for line in stats_summary(stats) {
+            panel.child().insert(Text::new(&format!(" {line}")));
         }
-        if let Some((seconds, date, site)) = &stats.longest {
-            records.push(format!(
-                "Longest {} min ({date}{})",
-                seconds / 60,
-                place(site)
-            ));
-        }
-        panel
-            .child()
-            .insert(Text::new(&format!(" {}", records.join("   "))));
-        let sites: Vec<String> = stats
-            .sites
-            .iter()
-            .take(4)
-            .map(|(site, dives)| format!("{site} ({dives})"))
-            .collect();
-        panel
-            .child()
-            .insert(Text::new(&format!(" Most dived: {}", sites.join(", "))));
 
         let legend: Vec<(String, Color)> = stats
             .countries
@@ -1297,11 +883,11 @@ impl Atom<TuiContext> for LineChart {
 mod tests {
     use std::time::Duration;
 
-    use blit::{Frame, FrameInfo, KeyInput, Modifiers, Point, PointerButton};
+    use blit::{Frame, FrameInfo, KeyInput, Modifiers, MouseButton, Point};
     use blit_tui::{RendererConfig, TuiRenderer};
 
     use super::*;
-    use crate::types::{GasMix, GradientFactors, Tank};
+    use crate::types::{DiveData, GasMix, GradientFactors, SafetyStop, Sample, Tank, Water};
 
     /// Render the viewer off-screen and return what the terminal would show.
     fn screen(app: &mut App, columns: u16, rows: u16) -> String {
@@ -1499,24 +1085,24 @@ mod tests {
     }
 
     fn press(x: usize, y: usize) -> Input<i32> {
-        Input::PointerDown {
+        Input::MouseDown {
             position: Point::new(x as i32, y as i32),
-            button: PointerButton::Primary,
+            button: MouseButton::Primary,
             modifiers: Modifiers::NONE,
         }
     }
 
     fn release(x: usize, y: usize) -> Input<i32> {
-        Input::PointerUp {
+        Input::MouseUp {
             position: Point::new(x as i32, y as i32),
-            button: PointerButton::Primary,
+            button: MouseButton::Primary,
             modifiers: Modifiers::NONE,
             leave: false,
         }
     }
 
     fn move_to(x: usize, y: usize) -> Input<i32> {
-        Input::PointerMove {
+        Input::MouseMove {
             position: Point::new(x as i32, y as i32),
             modifiers: Modifiers::NONE,
         }
@@ -1639,7 +1225,7 @@ mod tests {
         let mut app = App::new(path, three_dives());
 
         app.handle_input(Input::Text('i'));
-        assert!(!app.dives[2].ignored);
+        assert!(!app.logbook.dives[2].ignored);
         let text = screen(&mut app, 120, 36);
         row_of(&text, "#3 ");
         // The reason shows under the list, on a few lines

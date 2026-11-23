@@ -1,0 +1,4 @@
+# blit-desktop runs on blit-executor, which turns on the `must_not_suspend`
+# lint, a nightly feature: this lets the stable compiler build it
+[env]
+RUSTC_BOOTSTRAP = "1"

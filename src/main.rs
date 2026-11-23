@@ -1,12 +1,14 @@
 mod ble;
 mod dsx;
 mod fit;
+mod gui;
 mod merge;
 mod parser;
 mod protocol;
 mod stats;
 mod tui;
 mod types;
+mod viewer;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -59,6 +61,14 @@ enum Commands {
 
     /// View dive logs in an interactive TUI (offline, no BLE needed)
     View {
+        /// Input JSON file with dive data
+        #[arg(short, long, default_value = "dives.json")]
+        input: PathBuf,
+    },
+
+    /// View dive logs in a window, as `view` does in the terminal (offline,
+    /// no BLE needed; Wayland or macOS)
+    Gui {
         /// Input JSON file with dive data
         #[arg(short, long, default_value = "dives.json")]
         input: PathBuf,
@@ -331,6 +341,7 @@ async fn main() -> Result<()> {
         },
         Commands::Dsx { command } => cmd_dsx(command).await,
         Commands::View { input } => tui::run(input),
+        Commands::Gui { input } => gui::run(input),
         Commands::Correlate { ssi, json } => cmd_correlate(ssi, json),
         Commands::Watermark {
             video,

@@ -10,7 +10,7 @@ Rust CLI tool that extracts dive logs from dive computers via Bluetooth Low Ener
 - **Download** dive logs over BLE (incremental — skips already-downloaded dives)
 - **Merge** a dive logged by two computers into one entry, with the best of both
 - **Correlate** with SSI dive log CSV exports to import dive site, country, and buddy info
-- **View** dive logs in an interactive TUI with depth/temperature/pressure charts
+- **View** dive logs in an interactive TUI or in a window, with depth/temperature/pressure charts
 - **Export** dives as FIT activities, for apps that overlay Garmin Descent dive data on video
 
 ## Supported Devices
@@ -25,6 +25,7 @@ Tested with the **Mares Sirius**.
 
 - Linux with BlueZ (BLE stack)
 - Rust toolchain
+- For the window of `gui`: Wayland, or macOS. On NixOS it loads `libwayland-client`, `libxkbcommon` and `libfontconfig` at run time, so they must be on `LD_LIBRARY_PATH`
 
 ## Build
 
@@ -32,6 +33,8 @@ Tested with the **Mares Sirius**.
 cd dive-rs
 cargo build --release
 ```
+
+The window toolkit, [blit](https://github.com/nicoburniske/blit), turns on one nightly-only lint; `.cargo/config.toml` lets the stable compiler build it.
 
 ## Usage
 
@@ -107,6 +110,14 @@ Dives are listed by date and numbered as the SSI logbook numbers them: in that o
 Press `s` for a page of statistics over the whole logbook: totals and records, dives per year and per month of the year with a colour per country, time under water, depths, and the air used per minute at the surface month after month. That last figure, also shown with each dive, is the gas gone from the tank over the dive time and the mean pressure; it needs a transmitter and is only as right as the tank size the watch was given.
 
 Press `i` to ignore the selected dive, an accidental one for instance. It leaves the list but stays in `dives.json`, marked as ignored, so the next download does not bring it back. `a` lists the ignored dives again, and `i` on one of them takes it back. The `fit` and `correlate` commands leave ignored dives out.
+
+### In a window
+
+```bash
+dive-rs gui
+```
+
+The same as `view`, in a window, with the same keys and the mouse besides: click a dive to select it, point at the chart to read the values at that moment, and use the buttons, each showing the key that does the same. Ignoring a dive writes `dives.json` as `view` does.
 
 ### Export to FIT
 
