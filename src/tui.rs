@@ -1169,7 +1169,7 @@ mod tests {
         let hidden = screen(&mut app, 120, 36);
         assert_eq!(row_of(&hidden, " #2 "), row_of(&hidden, " #1 ") - 1);
         assert!(!hidden.lines().any(|line| line.starts_with("│ #3")));
-        row_of(&hidden, "Dive #2  Air    (3 samples)    watch #3");
+        row_of(&hidden, "Dive #2  Air    (3 samples)    Sirius #3");
         row_of(&hidden, "i ignore  a show 1 ignored");
 
         // Listed again, the ignored dive sits between them without a number
@@ -1184,7 +1184,7 @@ mod tests {
         app.handle_input(Input::Text('j'));
         row_of(
             &screen(&mut app, 120, 36),
-            "Dive  Air    (3 samples)    watch #2    ignored",
+            "Dive  Air    (3 samples)    Sirius #2    ignored",
         );
     }
 
@@ -1273,7 +1273,7 @@ mod tests {
         assert_eq!(row + 1, row_of(&text, "#3 "));
         // The watch has no number for it
         row_of(&text, "Dive #4  Air    (0 samples)");
-        assert!(!text.contains("watch #0"));
+        assert!(!text.contains("Sirius #0"));
         row_of(&text, "Site:      Ras il-Hobz");
         row_of(&text, "No sample data");
         assert!(!text.contains("Gas:"));

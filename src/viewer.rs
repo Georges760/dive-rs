@@ -131,9 +131,9 @@ pub fn mode_short(mode: &DiveMode) -> &'static str {
 
 /// The numbers the dive has on each computer, to find it there.
 pub fn computer_numbers(dive: &DiveLog) -> Vec<String> {
-    let watch = (dive.number > 0).then(|| format!("watch #{}", dive.number));
+    let sirius = (dive.number > 0).then(|| format!("Sirius #{}", dive.number));
     let dsx = dive.dsx_number.map(|number| format!("DSX #{number}"));
-    watch.into_iter().chain(dsx).collect()
+    sirius.into_iter().chain(dsx).collect()
 }
 
 /// What is known of a dive, as (label, value) in two columns.
