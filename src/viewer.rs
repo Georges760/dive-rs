@@ -275,8 +275,15 @@ pub fn dive_fields(dive: &DiveLog) -> [Vec<(&'static str, String)>; 2] {
     if let Some(sac) = sac_l_min(dive) {
         right.push(("Air", format!("{sac:.1} l/min at the surface")));
     }
-    if let Some(start) = dive.start_position {
-        right.push(("GPS", format!("{:.5}, {:.5}", start.lat, start.lon)));
+    // Where the computer had a fix: going in, coming out
+    let positions = [
+        ("GPS start", dive.start_position),
+        ("GPS end", dive.end_position),
+    ];
+    for (label, position) in positions {
+        if let Some(at) = position {
+            right.push((label, format!("{:.5}, {:.5}", at.lat, at.lon)));
+        }
     }
     if !dive.gradient_factors.is_empty() {
         let sets: Vec<String> = dive

@@ -1328,20 +1328,28 @@ mod tests {
     }
 
     #[test]
-    fn numbers_on_both_computers_and_the_position_show() {
+    fn numbers_on_both_computers_and_the_positions_show() {
+        let at = |lat, lon| Some(crate::types::Position { lat, lon });
         let mut dives = three_dives();
         for dive in &mut dives {
             dive.dsx_number = Some(20);
-            dive.start_position = Some(crate::types::Position {
-                lat: 36.0175,
-                lon: 14.2528,
-            });
+            dive.start_position = at(36.0175, 14.2528);
+            dive.end_position = at(36.01837, 14.25271);
         }
-        let mut app = App::new(PathBuf::new(), dives);
+        let mut app = App::new(PathBuf::new(), dives.clone());
 
         let text = screen(&mut app, 120, 36);
         assert!(text.contains("DSX #20"));
-        row_of(&text, "GPS:       36.01750, 14.25280");
+        row_of(&text, "GPS start: 36.01750, 14.25280");
+        row_of(&text, "GPS end:   36.01837, 14.25271");
+
+        // No fix before going in: the way out only
+        for dive in &mut dives {
+            dive.start_position = None;
+        }
+        let text = screen(&mut App::new(PathBuf::new(), dives), 120, 36);
+        assert!(!text.contains("GPS start"));
+        row_of(&text, "GPS end:   36.01837, 14.25271");
     }
 
     #[test]
