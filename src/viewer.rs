@@ -455,6 +455,9 @@ pub struct Profile {
     pub pressure2: Option<Overlay>,
     /// Both tanks added up, when there is a second one
     pub total_pressure: Option<Overlay>,
+    /// Depth of the stop the computer asks for, 0 out of deco, on the depth
+    /// axis. None for a dive that never needed one.
+    pub deco_stop: Option<Vec<(f32, f32)>>,
 }
 
 /// The pressures of both tanks added up at each sample where either has
@@ -545,6 +548,13 @@ impl Profile {
             curve.estimated = second_tank_estimated(dive);
         }
         let temp = column(|s| s.temp_c);
+        let deco = dive.samples.iter().any(|s| s.deco_stop_m.is_some());
+        let deco_stop = deco.then(|| {
+            dive.samples
+                .iter()
+                .map(|s| (s.time_s as f32 / 60.0, s.deco_stop_m.unwrap_or(0) as f32))
+                .collect()
+        });
 
         Self {
             time_bound,
@@ -558,6 +568,7 @@ impl Profile {
             pressure: overlay(&first, pressures),
             pressure2,
             total_pressure,
+            deco_stop,
         }
     }
 }
@@ -648,6 +659,26 @@ pub fn stats_summary(stats: &Stats) -> [String; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_deco_stop_follows_the_computer() {
+        let sample = |time_s, deco_stop_m| Sample {
+            time_s,
+            depth_m: 20.0,
+            deco_stop_m,
+            ..Default::default()
+        };
+        let mut dive = DiveLog {
+            samples: vec![sample(0, None), sample(60, Some(3)), sample(120, None)],
+            ..Default::default()
+        };
+        let stop = Profile::new(&dive).deco_stop.unwrap();
+        assert_eq!(stop, [(0.0, 0.0), (1.0, 3.0), (2.0, 0.0)]);
+
+        // Never in deco: nothing to draw
+        dive.samples[1].deco_stop_m = None;
+        assert!(Profile::new(&dive).deco_stop.is_none());
+    }
 
     #[test]
     fn a_position_has_its_page_on_google_maps() {

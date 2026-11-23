@@ -49,6 +49,10 @@ mod colors {
     pub const TIME: Color = Color::rgb(255, 209, 102);
     pub const ALARM: Color = Color::rgb(247, 131, 172);
     pub const LINK: Color = Color::rgb(116, 192, 252);
+    /// The deco stop, deeper than the red of the temperature, and the
+    /// water above it
+    pub const DECO: Color = Color::rgb(230, 40, 55);
+    pub const DECO_AREA: Color = Color::rgba(230, 40, 55, 60);
     pub const SCUBA: Color = Color::rgb(255, 209, 102);
     pub const FREEDIVE: Color = Color::rgb(76, 201, 240);
     /// Water under the surface of the chart, then down at the curve
@@ -133,6 +137,7 @@ struct App {
     show_depth: bool,
     show_temp: bool,
     show_pressure: bool,
+    show_deco: bool,
     /// The figures of the statistics page, while it is the one shown
     stats: Option<Stats>,
     /// Sample picked on the chart, as (dive index, sample index). Set while
@@ -168,6 +173,7 @@ impl App {
             show_depth: true,
             show_temp: true,
             show_pressure: true,
+            show_deco: true,
             stats: None,
             cursor: Cell::new(None),
             open_url: open_in_browser,
@@ -199,6 +205,8 @@ impl App {
             Input::Text('d') => self.show_depth = !self.show_depth,
             Input::Text('t') => self.show_temp = !self.show_temp,
             Input::Text('p') => self.show_pressure = !self.show_pressure,
+            // c for ceiling: d is the depth
+            Input::Text('c') => self.show_deco = !self.show_deco,
             Input::Text('j') => logbook.selected = (logbook.selected + 1).min(last),
             Input::Text('k') => logbook.selected = logbook.selected.saturating_sub(1),
             Input::Key(key) if key.pressed => match key.key {
@@ -519,8 +527,7 @@ impl App {
             let pressures = match (&profile.total_pressure, &profile.pressure) {
                 // A sidemount pair: their total, then each tank
                 (Some(total), first) => {
-                    let mut labels =
-                        vec![(format!("Pressure {} bar", span(total)), colors::PRESSURE)];
+                    let mut labels = vec![(format!("Pressure {}", span(total)), colors::PRESSURE)];
                     if let Some(first) = first {
                         labels.push((format!("1: {}", span(first)), colors::PRESSURE1));
                     }
@@ -537,6 +544,10 @@ impl App {
             };
             if let Some(labels) = pressures {
                 curves.push((labels, 'p', self.show_pressure));
+            }
+            if profile.deco_stop.is_some() {
+                let label = vec![("Deco".to_string(), colors::DECO)];
+                curves.push((label, 'c', self.show_deco));
             }
             for (labels, key, on) in curves {
                 let clicked = header
@@ -616,6 +627,7 @@ impl App {
             }
         }
         let depth = self.show_depth.then_some(profile.depth);
+        let deco_stop = profile.deco_stop.filter(|_| self.show_deco);
         let cursor = picked.map(|sample| (sample.time_s as f32 / 60.0, sample.depth_m as f32));
         let (time_bound, depth_bound) = (profile.time_bound, profile.depth_bound);
         panel
@@ -642,6 +654,7 @@ impl App {
                 ui.insert(ProfileChart {
                     curves,
                     depth,
+                    deco_stop,
                     time_bound,
                     depth_bound,
                     cursor,
@@ -1256,6 +1269,8 @@ struct ProfileChart {
     curves: Vec<(Vec<(f32, f32)>, Color)>,
     /// (minutes, metres) when the depth curve is shown
     depth: Option<Vec<(f32, f32)>>,
+    /// (minutes, metres) of the deco stop, when shown
+    deco_stop: Option<Vec<(f32, f32)>>,
     time_bound: f32,
     depth_bound: f32,
     /// The picked sample, (minutes, metres)
@@ -1326,22 +1341,35 @@ impl<C: blit_gui::Context> Atom<C> for ProfileChart {
 
         // The water down to the depth curve, lighter at the surface
         if let Some(depth) = &self.depth {
-            let mut vertices = Vec::with_capacity(depth.len() * 2);
-            for point in depth {
-                let (x, y) = at(point);
-                vertices.push(MeshVertex::new(x, plot.y, colors::SURFACE_WATER));
-                vertices.push(MeshVertex::new(x, y, colors::DEEP_WATER));
-            }
-            let indices: Vec<u32> = (0..depth.len().saturating_sub(1) as u32)
-                .flat_map(|i| {
-                    let (top, bottom) = (2 * i, 2 * i + 1);
-                    [top, bottom, top + 2, bottom, bottom + 2, top + 2]
-                })
-                .collect();
+            let points: Vec<(f32, f32)> = depth.iter().map(at).collect();
+            let (vertices, indices) =
+                fill_down(plot.y, &points, colors::SURFACE_WATER, colors::DEEP_WATER);
             gui.paint_mesh(Mesh {
                 vertices: &vertices,
                 indices: &indices,
             });
+        }
+
+        // The deco stop: the water above it in red, then a red line where
+        // there is one
+        if let Some(stop) = &self.deco_stop {
+            let points: Vec<(f32, f32)> = stop.iter().map(at).collect();
+            let (vertices, indices) =
+                fill_down(plot.y, &points, colors::DECO_AREA, colors::DECO_AREA);
+            gui.paint_mesh(Mesh {
+                vertices: &vertices,
+                indices: &indices,
+            });
+            for run in stop.chunk_by(|a, b| (a.1 > 0.0) == (b.1 > 0.0)) {
+                if run[0].1 > 0.0 {
+                    let run: Vec<(f32, f32)> = run.iter().map(at).collect();
+                    let (vertices, indices) = stroke(&run, 2.0, colors::DECO);
+                    gui.paint_mesh(Mesh {
+                        vertices: &vertices,
+                        indices: &indices,
+                    });
+                }
+            }
         }
 
         let curves = self
@@ -1366,6 +1394,27 @@ impl<C: blit_gui::Context> Atom<C> for ProfileChart {
             );
         }
     }
+}
+
+/// Triangles filling from `top` down to `points`, in `upper` colour at the
+/// top and `lower` along the points.
+fn fill_down(
+    top: f32,
+    points: &[(f32, f32)],
+    upper: Color,
+    lower: Color,
+) -> (Vec<MeshVertex>, Vec<u32>) {
+    let vertices = points
+        .iter()
+        .flat_map(|&(x, y)| [MeshVertex::new(x, top, upper), MeshVertex::new(x, y, lower)])
+        .collect();
+    let indices = (0..points.len().saturating_sub(1) as u32)
+        .flat_map(|i| {
+            let (top, bottom) = (2 * i, 2 * i + 1);
+            [top, bottom, top + 2, bottom, bottom + 2, top + 2]
+        })
+        .collect();
+    (vertices, indices)
 }
 
 /// Triangles drawing a line through `points`, `width` wide.
@@ -1498,6 +1547,31 @@ mod tests {
 
     fn app() -> App {
         App::new(Logbook::new(PathBuf::new(), dives()))
+    }
+
+    #[test]
+    fn the_deco_stop_shows_in_red() {
+        let mut dives = dives();
+        for dive in &mut dives {
+            for sample in &mut dive.samples[20..=50] {
+                sample.deco_stop_m = Some(6);
+            }
+        }
+        let mut app = App::new(Logbook::new(PathBuf::new(), dives));
+        let chart = ProfileChart::plot(area(&mut app, Id::new("depth chart")));
+        // Half way through the dive, at 30 m, with a stop at 6 m
+        let red = |app: &mut App, inputs: &[Input<f32>]| {
+            let pixels = {
+                let (frame, context) = render(app, inputs);
+                paint(frame, context)
+            };
+            let x = (chart.x + chart.width / 2.0) as usize;
+            (chart.y as usize..(chart.y + chart.height) as usize)
+                .any(|y| pixels[y * WIDTH as usize + x] == rgb(colors::DECO))
+        };
+        assert!(red(&mut app, &[]));
+        // c hides it, as its button does
+        assert!(!red(&mut app, &[Input::Text('c')]));
     }
 
     #[test]
