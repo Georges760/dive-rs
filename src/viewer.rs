@@ -119,14 +119,18 @@ impl Logbook {
     }
 }
 
-pub fn mode_short(mode: &DiveMode) -> &'static str {
-    match mode {
+/// The kind of dive in a few letters: on open circuit, the gas after "SM"
+/// in sidemount or "OC" in backmount.
+pub fn mode_short(dive: &DiveLog) -> String {
+    let gas = match dive.dive_mode {
         DiveMode::Air => "Air",
         DiveMode::Nitrox => "Nx",
-        DiveMode::Gauge => "Gau",
-        DiveMode::Freedive => "Free",
-        DiveMode::Ccr => "CCR",
-    }
+        DiveMode::Gauge => return "Gau".to_string(),
+        DiveMode::Freedive => return "Free".to_string(),
+        DiveMode::Ccr => return "CCR".to_string(),
+    };
+    let mount = if dive.sidemount { "SM" } else { "OC" };
+    format!("{mount} {gas}")
 }
 
 /// The numbers the dive has on each computer, to find it there.
@@ -627,6 +631,21 @@ pub fn stats_summary(stats: &Stats) -> [String; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_kind_of_dive_tells_sidemount_from_backmount() {
+        let dive = |dive_mode, sidemount| DiveLog {
+            dive_mode,
+            sidemount,
+            ..Default::default()
+        };
+        assert_eq!(mode_short(&dive(DiveMode::Air, true)), "SM Air");
+        assert_eq!(mode_short(&dive(DiveMode::Air, false)), "OC Air");
+        assert_eq!(mode_short(&dive(DiveMode::Nitrox, false)), "OC Nx");
+        // Not on open circuit, or no tank at all
+        assert_eq!(mode_short(&dive(DiveMode::Ccr, false)), "CCR");
+        assert_eq!(mode_short(&dive(DiveMode::Freedive, false)), "Free");
+    }
 
     #[test]
     fn both_tanks_and_their_total_share_one_scale() {

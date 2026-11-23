@@ -238,7 +238,7 @@ impl App {
             .child()
             .item(
                 flex::item()
-                    .width(Sizing::fixed(410.0))
+                    .width(Sizing::fixed(420.0))
                     .height(Sizing::grow()),
             )
             .build(|ui: Ui<'_>| self.render_dive_list(ui));
@@ -376,12 +376,7 @@ impl App {
                                 text_color,
                                 HorizontalAlign::Right,
                             ),
-                            (
-                                mode_short(&dive.dive_mode).to_string(),
-                                40.0,
-                                colors::MUTED,
-                                HorizontalAlign::Left,
-                            ),
+                            (mode_short(dive), 52.0, colors::MUTED, HorizontalAlign::Left),
                         ];
                         for (text, width, color, align) in cells {
                             row.child()

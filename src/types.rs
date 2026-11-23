@@ -276,6 +276,10 @@ pub struct DiveLog {
     /// is not there would come back with the next download.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub ignored: bool,
+    /// Dived in sidemount, one tank or two; in backmount otherwise. Set by
+    /// hand: no dive computer logs it.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub sidemount: bool,
 }
 
 impl DiveLog {

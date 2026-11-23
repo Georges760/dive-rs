@@ -87,6 +87,7 @@ fn merge(existing: DiveLog, incoming: DiveLog) -> DiveLog {
     }
     base.dsx_number = base.dsx_number.or(other.dsx_number);
     base.ignored |= other.ignored;
+    base.sidemount |= other.sidemount;
 
     macro_rules! or_other {
         ($($field:ident),* $(,)?) => {

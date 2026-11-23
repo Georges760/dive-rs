@@ -173,7 +173,7 @@ impl App {
                         dive.datetime.format("%Y-%m-%d"),
                         dive.max_depth_m,
                         dive.duration_seconds / 60,
-                        mode_short(&dive.dive_mode),
+                        mode_short(dive),
                     );
                     if index == selected {
                         ui.insert(Block::new().background(Color::CYAN));
@@ -1351,13 +1351,13 @@ mod tests {
         let mut app = App::new(PathBuf::new(), dives);
 
         // What goes to the terminal, escape sequences included
-        let context = render(&mut app, 120, 36);
+        let context = render(&mut app, 140, 36);
         let output = String::from_utf8_lossy(context.renderer().output());
 
         // Cyan for the freedive session, yellow for a scuba dive, and the
         // default colour back for the rest of the row
-        assert!(output.contains("\x1b[36m #1   \x1b[39m2025-08-01  31.2m  49min Fr"));
-        assert!(output.contains("\x1b[33m #1   \x1b[39m2025-08-01  31.2m  49min Ai"));
+        assert!(output.contains("\x1b[36m #1   \x1b[39m2025-08-01  31.2m  49min Free"));
+        assert!(output.contains("\x1b[33m #1   \x1b[39m2025-08-01  31.2m  49min OC Air"));
         // The selected row keeps its own colours, number included
         assert!(output.contains("\x1b[0;1;30;46m #2   2025-08-01"));
     }
