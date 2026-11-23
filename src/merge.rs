@@ -1,6 +1,7 @@
 //! A dive logged by two computers becomes one entry with the best of both:
 //! the profile of the one that samples more often, and from the other
-//! whatever that one does not have, such as tank pressure.
+//! whatever that one does not have, such as tank pressure. The deco comes
+//! whole from one of them.
 
 use crate::types::*;
 
@@ -136,13 +137,46 @@ fn merge(existing: DiveLog, incoming: DiveLog) -> DiveLog {
         base.dive_mode = other.dive_mode;
     }
 
+    // Each computer works out its own deco: the no-deco times, stops and
+    // gradient factors of the profile all come from one of them, or it would
+    // read a no-deco time of 99 next to a stop at 6 m. The one that logs its
+    // gradient factors wins, as they go with its stops.
+    let deco_from_other =
+        has_deco(&other) && (!has_deco(&base) || (has_gf(&other) && !has_gf(&base)));
+
     fill_samples(
         &mut base.samples,
         &other.samples,
         other_gases,
+        deco_from_other,
         interval(&other),
     );
     base
+}
+
+/// Whether a profile has the no-deco times or stops of its computer.
+fn has_deco(dive: &DiveLog) -> bool {
+    dive.samples
+        .iter()
+        .any(|sample| sample.ndl_min.is_some() || sample.deco_time_min.is_some())
+}
+
+/// Whether a profile has the gradient factors of its computer.
+fn has_gf(dive: &DiveLog) -> bool {
+    dive.samples
+        .iter()
+        .any(|sample| sample.gf_pct.is_some() || sample.surface_gf_pct.is_some())
+}
+
+/// Give a sample the deco a computer worked out at that moment.
+fn copy_deco(to: &mut Sample, from: &Sample) {
+    to.ndl_min = from.ndl_min;
+    to.deco_time_min = from.deco_time_min;
+    to.deco_stop_m = from.deco_stop_m;
+    to.gf_pct = from.gf_pct;
+    to.surface_gf_pct = from.surface_gf_pct;
+    to.gf_set = from.gf_set;
+    to.safety_stop = from.safety_stop;
 }
 
 /// Depth at a moment of a profile, between its samples.
@@ -202,9 +236,15 @@ fn nearest(samples: &[Sample], time_s: i64) -> Option<usize> {
 }
 
 /// Complete the samples of `base` with what the other computer logged at the
-/// same moment. What marks a moment, alarms and bookmarks, goes on one sample
-/// only.
-fn fill_samples(base: &mut [Sample], other: &[Sample], other_gases: bool, interval: Option<u32>) {
+/// same moment, and with its deco instead of their own if `deco_from_other`.
+/// What marks a moment, alarms and bookmarks, goes on one sample only.
+fn fill_samples(
+    base: &mut [Sample],
+    other: &[Sample],
+    other_gases: bool,
+    deco_from_other: bool,
+    interval: Option<u32>,
+) {
     let (Some(interval), false) = (interval, base.is_empty()) else {
         return;
     };
@@ -212,13 +252,16 @@ fn fill_samples(base: &mut [Sample], other: &[Sample], other_gases: bool, interv
 
     for sample in base.iter_mut() {
         let moment = sample.time_s as i64 + shift;
-        let Some(index) = nearest(other, moment) else {
+        let source = nearest(other, moment)
+            .map(|index| &other[index])
+            .filter(|source| (source.time_s as i64 - moment).abs() <= interval as i64);
+        // Past the end of the other log, no deco rather than that of the base
+        if deco_from_other {
+            copy_deco(sample, source.unwrap_or(&Sample::default()));
+        }
+        let Some(source) = source else {
             continue;
         };
-        let source = &other[index];
-        if (source.time_s as i64 - moment).abs() > interval as i64 {
-            continue;
-        }
         macro_rules! or_source {
             ($($field:ident),* $(,)?) => {
                 $(sample.$field = sample.$field.take().or(source.$field.clone());)*
@@ -229,20 +272,11 @@ fn fill_samples(base: &mut [Sample], other: &[Sample], other_gases: bool, interv
             pressure_bar,
             ambient_mbar,
             speed_m_min,
-            ndl_min,
-            deco_time_min,
-            deco_stop_m,
-            gf_pct,
-            surface_gf_pct,
-            safety_stop,
             gas_time_min,
             sac_l_min,
         );
         if other_gases {
             sample.gas = source.gas;
-        }
-        if sample.gf_set == 0 {
-            sample.gf_set = source.gf_set;
         }
     }
 
@@ -368,6 +402,99 @@ mod tests {
             assert_eq!(dives.len(), 1);
             check_merged(&dives[0]);
         }
+    }
+
+    /// The Sirius with its gradient factors and a stop at 3 m from 1000 s,
+    /// the DSX with a longer stop at 6 m from 800 s and minutes of log after
+    /// the dive.
+    fn with_deco() -> (DiveLog, DiveLog) {
+        let mut sirius = sirius();
+        for sample in &mut sirius.samples {
+            if sample.time_s < 1000 {
+                sample.ndl_min = Some(99);
+            } else {
+                (sample.deco_time_min, sample.deco_stop_m) = (Some(3), Some(3));
+            }
+            sample.surface_gf_pct = Some(50.0);
+        }
+        let mut dsx = dsx();
+        for sample in &mut dsx.samples {
+            if sample.time_s < 800 {
+                sample.ndl_min = Some(20);
+            } else {
+                (sample.deco_time_min, sample.deco_stop_m) = (Some(9), Some(6));
+            }
+        }
+        let end = dsx.samples.last().unwrap().time_s;
+        dsx.samples.extend((1..=300).map(|i| Sample {
+            time_s: end + i * 2,
+            deco_time_min: Some(12),
+            deco_stop_m: Some(6),
+            ..Default::default()
+        }));
+        (sirius, dsx)
+    }
+
+    #[test]
+    fn the_deco_comes_from_the_computer_with_gradient_factors() {
+        let (sirius, dsx) = with_deco();
+        for (first, second) in [(sirius.clone(), dsx.clone()), (dsx, sirius)] {
+            let mut dives = vec![first];
+            add_dives(&mut dives, vec![second]);
+            let samples = &dives[0].samples;
+            assert_eq!(samples.len(), 1200);
+
+            let deco = |sample: &Sample| {
+                (
+                    sample.ndl_min,
+                    sample.deco_time_min,
+                    sample.deco_stop_m,
+                    sample.surface_gf_pct,
+                )
+            };
+            // 600 s here, 603 s on the Sirius
+            assert_eq!(deco(&samples[300]), (Some(99), None, None, Some(50.0)));
+            // In deco for the DSX from 800 s, but not yet for the Sirius
+            assert_eq!(deco(&samples[450]), (Some(99), None, None, Some(50.0)));
+            assert_eq!(deco(&samples[700]), (None, Some(3), Some(3), Some(50.0)));
+            // After the end of the Sirius log, no deco left
+            assert_eq!(deco(samples.last().unwrap()), (None, None, None, None));
+        }
+    }
+
+    #[test]
+    fn the_deco_of_two_computers_is_not_mixed() {
+        let (mut sirius, mut dsx) = with_deco();
+        for sample in &mut sirius.samples {
+            sample.surface_gf_pct = None;
+        }
+        // The DSX logs no no-deco time while there is no limit
+        for sample in &mut dsx.samples[..100] {
+            sample.ndl_min = None;
+        }
+
+        // Neither has gradient factors: the profile keeps its own deco
+        let mut dives = vec![dsx.clone()];
+        add_dives(&mut dives, vec![sirius.clone()]);
+        let samples = &dives[0].samples;
+        assert_eq!(samples[50].ndl_min, None);
+        assert_eq!(
+            (samples[700].deco_time_min, samples[700].deco_stop_m),
+            (Some(9), Some(6))
+        );
+
+        // It has none at all: that of the other computer
+        for sample in &mut dsx.samples {
+            (sample.ndl_min, sample.deco_time_min, sample.deco_stop_m) = (None, None, None);
+        }
+        let mut dives = vec![dsx];
+        add_dives(&mut dives, vec![sirius]);
+        let samples = &dives[0].samples;
+        assert_eq!(samples[50].ndl_min, Some(99));
+        assert_eq!(
+            (samples[700].deco_time_min, samples[700].deco_stop_m),
+            (Some(3), Some(3))
+        );
     }
 
     #[test]
