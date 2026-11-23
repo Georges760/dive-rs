@@ -1525,7 +1525,7 @@ mod tests {
     fn dives() -> Vec<DiveLog> {
         (1..=3)
             .map(|number| DiveLog {
-                number,
+                sirius_number: Some(number),
                 datetime: chrono::NaiveDate::from_ymd_opt(2025, 8, number)
                     .unwrap()
                     .and_hms_opt(10, 0, 0)

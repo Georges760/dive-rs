@@ -32,7 +32,7 @@ pub fn add_dives(dives: &mut Vec<DiveLog>, new: Vec<DiveLog>) -> usize {
             None => dives.push(dive),
         }
     }
-    dives.sort_by_key(|dive| (dive.datetime, dive.number));
+    dives.sort_by_key(|dive| (dive.datetime, dive.sirius_number));
     merged
 }
 
@@ -42,7 +42,8 @@ fn same_dive(a: &DiveLog, b: &DiveLog) -> bool {
     if a.dive_mode == DiveMode::Freedive || b.dive_mode == DiveMode::Freedive {
         return false;
     }
-    if (a.number > 0 && b.number > 0) || (a.dsx_number.is_some() && b.dsx_number.is_some()) {
+    let both = |number: fn(&DiveLog) -> Option<u32>| number(a).is_some() && number(b).is_some();
+    if both(|dive| dive.sirius_number) || both(|dive| dive.dsx_number) {
         return false;
     }
     if (a.datetime - b.datetime).num_seconds().abs() > MAX_START_GAP_S {
@@ -82,9 +83,7 @@ fn merge(existing: DiveLog, incoming: DiveLog) -> DiveLog {
         (existing, incoming)
     };
 
-    if base.number == 0 {
-        base.number = other.number;
-    }
+    base.sirius_number = base.sirius_number.or(other.sirius_number);
     base.dsx_number = base.dsx_number.or(other.dsx_number);
     base.ignored |= other.ignored;
     base.sidemount |= other.sidemount;
@@ -316,7 +315,7 @@ mod tests {
     /// of the other log.
     fn sirius() -> DiveLog {
         DiveLog {
-            number: 146,
+            sirius_number: Some(146),
             datetime: at(9, 42),
             duration_seconds: 1800,
             max_depth_m: 21.0,
@@ -380,7 +379,7 @@ mod tests {
     }
 
     fn check_merged(dive: &DiveLog) {
-        assert_eq!((dive.number, dive.dsx_number), (146, Some(20)));
+        assert_eq!((dive.sirius_number, dive.dsx_number), (Some(146), Some(20)));
         // The finer profile, with the tank of the other computer on it
         assert_eq!(dive.samples.len(), 900);
         assert_eq!(dive.samples[1].time_s, 2);
@@ -557,7 +556,7 @@ mod tests {
         // A freedive session
         assert_eq!(new(|dive| dive.dive_mode = DiveMode::Freedive), (0, 2));
         // Two dives of the same computer are two dives
-        assert_eq!(new(|dive| dive.number = 147), (0, 2));
+        assert_eq!(new(|dive| dive.sirius_number = Some(147)), (0, 2));
 
         // Starts within the limit, but barely shares any time
         let mut short = sirius();

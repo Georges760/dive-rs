@@ -209,12 +209,12 @@ struct Point {
     pressure_bar: Option<f64>,
     pressure2_bar: Option<f64>,
     ambient_mbar: Option<f64>,
-    /// Index of the sample this time falls under, for what the watch
+    /// Index of the sample this time falls under, for what the computer
     /// counts in steps: no-deco time, deco stop, gas time...
     sample: usize,
 }
 
-/// The FIT event a Descent logs for an alarm of the watch, as (event, data).
+/// The FIT event a Descent logs for an alarm of the Sirius, as (event, data).
 /// Most are a dive alert, with the kind of alert as data. `None` for the
 /// alarms it has no counterpart of.
 fn alarm_event(alarm: &str) -> Option<(u8, Option<u32>)> {
@@ -331,7 +331,7 @@ pub fn encode_dive(
     let begin = fit_time(start);
     let end = begin + elapsed_s;
 
-    // The watch's own figures where it logs them, else worked out
+    // The computer's own figures where it logs them, else worked out
     let avg_depth =
         depth(dive.avg_depth_m.unwrap_or_else(|| {
             points.iter().map(|p| p.depth_m).sum::<f64>() / points.len() as f64
@@ -533,7 +533,7 @@ pub fn encode_dive(
         fit.message(MESG_DEVICE_INFO, &device_info(end, dive.battery_end_pct));
     }
 
-    // Tank pressures as the watch sums them up, one summary per tank, else
+    // Tank pressures as the computer sums them up, one summary per tank, else
     // the first and last readings
     let mut pressures = points.iter().filter_map(|p| p.pressure_bar);
     let tanks: Vec<(f64, f64, Option<u32>)> = dive
@@ -601,7 +601,7 @@ pub fn encode_dive(
             (150, degrees(dive.min_temp_c.unwrap_or(min))),
         ]);
     }
-    // Surface interval (0 when the watch counts none), CNS clock and OTU,
+    // Surface interval (0 when the computer counts none), CNS clock and OTU,
     // which the session and the dive summary number differently
     let interval = dive.surface_interval_s.filter(|&seconds| seconds > 0);
     let percent = |cns: f64| Value::Uint8(cns.round() as u8);
@@ -714,7 +714,7 @@ mod tests {
 
     fn dive() -> DiveLog {
         DiveLog {
-            number: 7,
+            sirius_number: Some(7),
             datetime: start(),
             duration_seconds: 1800,
             max_depth_m: 20.2,
@@ -915,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_carries_the_figures_of_the_watch() {
+    fn summary_carries_the_figures_of_the_computer() {
         let begin = fit_time(start());
         let messages = decode(&encode_dive(&full_dive(), 7, start(), 0, 0).unwrap());
         let find = |global: u16| messages.iter().find(|message| message.0 == global).unwrap();

@@ -77,7 +77,7 @@ impl Logbook {
         // By date, as the dives are numbered
         self.listed.sort_by_key(|&dive| {
             let dive = &self.dives[dive];
-            std::cmp::Reverse((dive.datetime, dive.number))
+            std::cmp::Reverse((dive.datetime, dive.sirius_number))
         });
 
         let row = keep.and_then(|keep| self.listed.iter().position(|&dive| dive == keep));
@@ -137,7 +137,7 @@ pub fn mode_short(dive: &DiveLog) -> String {
 
 /// The numbers the dive has on each computer, to find it there.
 pub fn computer_numbers(dive: &DiveLog) -> Vec<String> {
-    let sirius = (dive.number > 0).then(|| format!("Sirius #{}", dive.number));
+    let sirius = dive.sirius_number.map(|number| format!("Sirius #{number}"));
     let dsx = dive.dsx_number.map(|number| format!("DSX #{number}"));
     sirius.into_iter().chain(dsx).collect()
 }
@@ -246,7 +246,7 @@ pub fn dive_fields(dive: &DiveLog) -> [Vec<(&'static str, String)>; 2] {
         left.push(("Buddy/Ctr", buddy.clone()));
     }
 
-    // 0 when the watch counts the dive as the first
+    // 0 when the computer counts the dive as the first
     if let Some(interval) = dive.surface_interval_s.filter(|&s| s > 0) {
         left.push((
             "Surface",
@@ -390,7 +390,7 @@ pub fn sample_values(dive: &DiveLog, sample: &Sample) -> [String; 4] {
 }
 
 /// What the newer logs hold at a sample, as three pieces of text: where the
-/// dive stands, what the watch works out, and the alarms it raises.
+/// dive stands, what the computer works out, and the alarms it raises.
 pub fn sample_readout(sample: &Sample) -> [String; 3] {
     let mut state = Vec::new();
     if let Some(speed) = sample.speed_m_min {

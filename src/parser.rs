@@ -234,11 +234,11 @@ pub fn parse_dive_ecop(dive_index: u32, header: &[u8], profile: &[u8]) -> Result
     let profile = parse_ecop_profile(profile, sample_interval);
 
     Ok(DiveLog {
-        number: if dive_number > 0 {
+        sirius_number: Some(if dive_number > 0 {
             dive_number
         } else {
             dive_index + 1
-        },
+        }),
         datetime,
         // The header of the first GENIUS firmware stops before this field
         end_datetime: (header.len() >= 0xC0)
@@ -310,11 +310,11 @@ fn parse_freedive_ecop(dive_index: u32, header: &[u8], data: &[u8]) -> Result<Di
     let max_depth_m = read_u16_le(header, 0x24) as f64 / 10.0;
 
     Ok(DiveLog {
-        number: if dive_number > 0 {
+        sirius_number: Some(if dive_number > 0 {
             dive_number
         } else {
             dive_index + 1
-        },
+        }),
         datetime,
         duration_seconds,
         max_depth_m,
@@ -705,7 +705,7 @@ mod tests {
     fn header_fields() {
         let dive = parse_dive_ecop(0, &header(), &[]).unwrap();
 
-        assert_eq!(dive.number, 143);
+        assert_eq!(dive.sirius_number, Some(143));
         assert_eq!(dive.datetime.to_string(), "2026-10-04 10:02:00");
         assert_eq!(
             dive.end_datetime.unwrap().to_string(),

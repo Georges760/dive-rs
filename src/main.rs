@@ -682,10 +682,8 @@ async fn cmd_download(
         match std::fs::read_to_string(&output) {
             Ok(contents) => match serde_json::from_str::<DiveData>(&contents) {
                 Ok(data) => {
-                    // Dives the watch did not log have no number from it
-                    for dive in data.dives.iter().filter(|dive| dive.number > 0) {
-                        existing_numbers.insert(dive.number);
-                    }
+                    existing_numbers
+                        .extend(data.dives.iter().filter_map(|dive| dive.sirius_number));
                     eprintln!(
                         "Loaded {} existing dive(s) from {}",
                         data.dives.len(),
@@ -773,7 +771,7 @@ async fn cmd_download(
                 Ok(dive) => {
                     eprintln!(
                         "\r  Dive #{}: {} | {:.1}m | {}s | {}",
-                        dive.number,
+                        dive.sirius_number.unwrap_or_default(),
                         dive.datetime.format("%Y-%m-%d %H:%M"),
                         dive.max_depth_m,
                         dive.duration_seconds,
@@ -838,10 +836,11 @@ async fn cmd_download(
             for dive in &all_dives {
                 let stem = output.file_stem().unwrap_or_default().to_string_lossy();
                 let dir = output.parent().unwrap_or(std::path::Path::new("."));
-                let csv_path = dir.join(format!("{}_{:03}.csv", stem, dive.number));
+                let number = dive.sirius_number.unwrap_or_default();
+                let csv_path = dir.join(format!("{stem}_{number:03}.csv"));
                 let csv = parser::dive_to_csv(dive);
                 std::fs::write(&csv_path, &csv)?;
-                eprintln!("  Dive #{} -> {}", dive.number, csv_path.display());
+                eprintln!("  Dive #{number} -> {}", csv_path.display());
             }
         }
     }
@@ -880,7 +879,7 @@ fn cmd_parse(raw_dir: PathBuf, output: PathBuf, format: OutputFormat) -> Result<
             Ok(dive) => {
                 eprintln!(
                     "  Dive #{}: {} | {:.1}m | {}min | {} | {:?}",
-                    dive.number,
+                    dive.sirius_number.unwrap_or_default(),
                     dive.datetime.format("%Y-%m-%d %H:%M"),
                     dive.max_depth_m,
                     dive.duration_seconds / 60,
@@ -917,10 +916,11 @@ fn cmd_parse(raw_dir: PathBuf, output: PathBuf, format: OutputFormat) -> Result<
             for dive in &dives {
                 let stem = output.file_stem().unwrap_or_default().to_string_lossy();
                 let dir = output.parent().unwrap_or(std::path::Path::new("."));
-                let csv_path = dir.join(format!("{}_{:03}.csv", stem, dive.number));
+                let number = dive.sirius_number.unwrap_or_default();
+                let csv_path = dir.join(format!("{stem}_{number:03}.csv"));
                 let csv = parser::dive_to_csv(dive);
                 std::fs::write(&csv_path, &csv)?;
-                eprintln!("  Dive #{} -> {}", dive.number, csv_path.display());
+                eprintln!("  Dive #{number} -> {}", csv_path.display());
             }
         }
     }
@@ -1272,7 +1272,8 @@ fn cmd_correlate(csv_path: PathBuf, json_path: PathBuf) -> Result<()> {
     if !imported.is_empty() {
         eprintln!("Imported {} dive(s) from the SSI logbook", imported.len());
         data.dives.append(&mut imported);
-        data.dives.sort_by_key(|dive| (dive.datetime, dive.number));
+        data.dives
+            .sort_by_key(|dive| (dive.datetime, dive.sirius_number));
     }
 
     // Write back
@@ -1847,7 +1848,7 @@ mod tests {
     /// Two dives of the same morning, the first one ignored in the viewer.
     fn write_dives(path: &std::path::Path) {
         let dive = |number: u32, hour: u32, ignored: bool| DiveLog {
-            number,
+            sirius_number: Some(number),
             datetime: chrono::NaiveDate::from_ymd_opt(2025, 10, 26)
                 .unwrap()
                 .and_hms_opt(hour, 21, 0)
@@ -1891,8 +1892,8 @@ mod tests {
 
         let dives = read_dives(&json);
         assert_eq!(
-            (dives[0].number, &dives[0].site, dives[0].ignored),
-            (47, &None, true)
+            (dives[0].sirius_number, &dives[0].site, dives[0].ignored),
+            (Some(47), &None, true)
         );
         assert_eq!(dives[1].site.as_deref(), Some("Red Rocks"));
         std::fs::remove_dir_all(dir).unwrap();
@@ -1958,13 +1959,13 @@ mod tests {
                 "\"plongée #\",\"Site de plongée\",\"Pays\",\"Date / Heure\",",
                 "\"Type d'activité de plongée\",\"Plongée de Spécialité\",\"Type de plongée\",",
                 "\"Durée\",\"Profondeur\",\"Equipier / Instructor / Center\"\n",
-                // The dive of the watch
+                // The dive of the Sirius
                 "\"100\",\"Red Rocks\",\"Croatie\",\"26. Oct 2025 12:21\",\"Plongée Récréative\",",
                 "\"\",\"Exploration\",\"45 min\",\"24 m \t\t(79 ft)\",\"Venus\"\n",
                 // The same dive entered again, nine minutes into it
                 "\"101\",\"Elsewhere\",\"\",\"26. Oct 2025 12:30\",\"Plongée Récréative\",",
                 "\"\",\"\",\"40 min\",\"20 m\",\"\"\n",
-                // Two dives from before the watch
+                // Two dives from before the Sirius
                 "\"12\",\"La muraillette\",\"France\",\"18. Jun 2022 11:54\",\"Plongée Récréative\",",
                 "\"\",\"Exploration\",\"31 min\",\"18.2 m \t\t(60 ft)\",\"Sirius\"\n",
                 "\"5\",\"Fosse\",\"France\",\"30. Mar 2022 16:22\",\"Apnée\",",
@@ -1977,11 +1978,11 @@ mod tests {
 
         cmd_correlate(ssi.clone(), json.clone()).unwrap();
 
-        // In the file by date: the two imported dives, which the watch has
+        // In the file by date: the two imported dives, which the Sirius has
         // no number for, then its own
         let dives = read_dives(&json);
-        let numbers: Vec<u32> = dives.iter().map(|dive| dive.number).collect();
-        assert_eq!(numbers, [0, 0, 47, 48]);
+        let numbers: Vec<Option<u32>> = dives.iter().map(|dive| dive.sirius_number).collect();
+        assert_eq!(numbers, [None, None, Some(47), Some(48)]);
         // In the logbook they come first, the ignored dive not being counted
         assert_eq!(logbook_numbers(&dives), [Some(1), Some(1), None, Some(2)]);
 

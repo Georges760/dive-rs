@@ -468,7 +468,7 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) {
         None => "  Dive  ".to_string(),
     };
     // The number the dive has on each computer, to find it there
-    let on_watch: String = computer_numbers(dive)
+    let on_computers: String = computer_numbers(dive)
         .iter()
         .map(|number| format!("    {number}"))
         .collect();
@@ -484,7 +484,7 @@ fn render_dive_info(ui: Ui<'_>, dive: &DiveLog, number: Option<u32>) {
             .attributes(TextAttributes::BOLD),
         Span::new(&mode).color(Color::YELLOW),
         Span::new(&count),
-        Span::new(&on_watch).color(Color::DARK_GRAY),
+        Span::new(&on_computers).color(Color::DARK_GRAY),
         Span::new(if dive.ignored { "    ignored" } else { "" }).color(Color::MAGENTA),
     ]));
 
@@ -949,7 +949,7 @@ mod tests {
     /// A dive as an older log holds it: depth, temperature, tank pressure.
     fn plain_dive() -> DiveLog {
         DiveLog {
-            number: 44,
+            sirius_number: Some(44),
             datetime: chrono::NaiveDate::from_ymd_opt(2025, 8, 1)
                 .unwrap()
                 .and_hms_opt(16, 3, 0)
@@ -966,7 +966,7 @@ mod tests {
         }
     }
 
-    /// The same dive with what the watch logs besides.
+    /// The same dive with what the Sirius logs besides.
     fn full_dive() -> DiveLog {
         let mut dive = plain_dive();
         dive.end_datetime = Some(dive.datetime + chrono::Duration::minutes(52));
@@ -1027,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn details_show_what_the_watch_logs_about_the_dive() {
+    fn details_show_what_the_computer_logs_about_the_dive() {
         let mut app = App::new(PathBuf::new(), vec![full_dive()]);
         let screen = screen(&mut app, 120, 36);
 
@@ -1081,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn readout_shows_what_the_watch_logs_at_the_picked_sample() {
+    fn readout_shows_what_the_computer_logs_at_the_picked_sample() {
         let mut app = App::new(PathBuf::new(), vec![full_dive()]);
 
         app.cursor.set(Some((0, 1)));
@@ -1126,7 +1126,7 @@ mod tests {
     fn three_dives() -> Vec<DiveLog> {
         (1..=3)
             .map(|number| DiveLog {
-                number,
+                sirius_number: Some(number),
                 ..plain_dive()
             })
             .collect()
@@ -1164,7 +1164,7 @@ mod tests {
     fn list_follows_the_keys_and_the_mouse() {
         let dives = (1..=40)
             .map(|number| DiveLog {
-                number,
+                sirius_number: Some(number),
                 ..plain_dive()
             })
             .collect();
@@ -1213,7 +1213,7 @@ mod tests {
         dives[1].ignored = true;
         let mut app = App::new(PathBuf::new(), dives);
 
-        // Two dives left, numbered 2 and 1 whatever the watch calls them
+        // Two dives left, numbered 2 and 1 whatever the Sirius calls them
         let hidden = screen(&mut app, 120, 36);
         assert_eq!(row_of(&hidden, " #2 "), row_of(&hidden, " #1 ") - 1);
         assert!(!hidden.lines().any(|line| line.starts_with("│ #3")));
@@ -1244,7 +1244,7 @@ mod tests {
                 serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
             data.dives
                 .iter()
-                .map(|dive| (dive.number, dive.ignored))
+                .map(|dive| (dive.sirius_number.unwrap_or_default(), dive.ignored))
                 .collect()
         };
         let mut app = App::new(path.clone(), three_dives());
@@ -1319,7 +1319,7 @@ mod tests {
         // First of the list and fourth dive of the logbook, as the latest
         let row = row_of(&text, "#4   2025-08-02  36.0m  67min");
         assert_eq!(row + 1, row_of(&text, "#3 "));
-        // The watch has no number for it
+        // The Sirius has no number for it
         row_of(&text, "Dive #4  Air    (0 samples)");
         assert!(!text.contains("Sirius #0"));
         row_of(&text, "Site:      Ras il-Hobz");
@@ -1379,7 +1379,7 @@ mod tests {
             dive.country = Some(country.to_string());
         }
         dives.push(DiveLog {
-            number: 4,
+            sirius_number: Some(4),
             datetime: plain_dive().datetime + chrono::Duration::days(365),
             country: Some("Malte".to_string()),
             max_depth_m: 20.0,

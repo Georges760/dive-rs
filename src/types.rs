@@ -58,7 +58,7 @@ pub enum DiveMode {
     Ccr,
 }
 
-/// Water type set on the watch.
+/// Water type set on the computer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Water {
@@ -91,12 +91,19 @@ fn is_zero(value: &u8) -> bool {
     *value == 0
 }
 
+/// A number where 0 stands for none, as older files have it.
+fn zero_is_none<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    Ok(Option::<u32>::deserialize(deserializer)?.filter(|&number| number != 0))
+}
+
 /// A tank whose pressure a transmitter reported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tank {
     pub start_bar: f64,
     pub end_bar: f64,
-    /// Size and working pressure as set on the watch
+    /// Size and working pressure as set on the computer
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_l: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,13 +138,13 @@ pub struct Sample {
     /// Pressure of the second tank, the other one of a sidemount pair
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pressure2_bar: Option<f64>,
-    /// Absolute pressure at the watch
+    /// Absolute pressure at the computer
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ambient_mbar: Option<u32>,
     /// Vertical speed, positive going up
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed_m_min: Option<f64>,
-    /// No-decompression time left; the watch counts no higher than 99
+    /// No-decompression time left; the Sirius counts no higher than 99
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ndl_min: Option<u32>,
     /// Decompression time, once a stop is required
@@ -164,7 +171,7 @@ pub struct Sample {
     pub safety_stop: Option<SafetyStop>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub alarms: Vec<String>,
-    /// Time the gas left in the tank lasts at this depth; the watch counts
+    /// Time the gas left in the tank lasts at this depth; the Sirius counts
     /// no higher than 99. Worked out from the logs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gas_time_min: Option<u32>,
@@ -195,15 +202,22 @@ pub struct Position {
 /// A parsed dive log entry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiveLog {
-    /// Number the Mares watch gives the dive; 0 if it did not log it. Not
-    /// the number shown: see `logbook_numbers`.
-    pub number: u32,
+    /// Number the Sirius gives the dive, if it logged it. Not the number
+    /// shown: see `logbook_numbers`. Files from before have it as `number`,
+    /// 0 for none.
+    #[serde(
+        alias = "number",
+        deserialize_with = "zero_is_none",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub sirius_number: Option<u32>,
     /// Number the Apeks DSX gives the dive, if it logged it
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub dsx_number: Option<u32>,
     #[serde(with = "datetime_format")]
     pub datetime: NaiveDateTime,
-    /// When the watch closed the dive, surface timeout included
+    /// When the computer closed the dive, surface timeout included
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_datetime: Option<NaiveDateTime>,
     pub duration_seconds: u32,
@@ -219,8 +233,8 @@ pub struct DiveLog {
     pub water: Option<Water>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub atmospheric_mbar: Option<u32>,
-    /// Time at the surface since the previous dive; 0 when the watch counts
-    /// this dive as the first
+    /// Time at the surface since the previous dive; 0 when the computer
+    /// counts this dive as the first
     #[serde(skip_serializing_if = "Option::is_none")]
     pub surface_interval_s: Option<u32>,
     /// Oxygen toxicity: CNS clock and pulmonary dose, before and after
@@ -232,7 +246,7 @@ pub struct DiveLog {
     pub otu_start: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub otu_end: Option<f64>,
-    /// Gradient factor sets configured on the watch
+    /// Gradient factor sets configured on the computer
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub gradient_factors: Vec<GradientFactors>,
     /// Fastest ascent of the dive. Worked out from the logs, as are the
@@ -253,7 +267,7 @@ pub struct DiveLog {
     pub tissue_he_mbar: Vec<f64>,
     pub gas_mixes: Vec<GasMix>,
     pub samples: Vec<Sample>,
-    /// Dips of a freedive session; the watch keeps no depth samples for them
+    /// Dips of a freedive session; the Sirius keeps no depth samples for them
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub dips: Vec<Dip>,
     /// Where the computer got a GPS fix on the way down and on the way out
@@ -286,7 +300,7 @@ impl DiveLog {
     /// Whether the dive was imported from a logbook: no dive computer
     /// handed it over, so it has no number of its own and no profile.
     pub fn is_logbook_only(&self) -> bool {
-        self.number == 0 && self.dsx_number.is_none()
+        self.sirius_number.is_none() && self.dsx_number.is_none()
     }
 }
 
@@ -295,7 +309,7 @@ impl DiveLog {
 /// dive has none, and leaves no gap.
 pub fn logbook_numbers(dives: &[DiveLog]) -> Vec<Option<u32>> {
     let mut by_date: Vec<usize> = (0..dives.len()).collect();
-    by_date.sort_by_key(|&dive| (dives[dive].datetime, dives[dive].number));
+    by_date.sort_by_key(|&dive| (dives[dive].datetime, dives[dive].sirius_number));
 
     let mut numbers = vec![None; dives.len()];
     let (mut scuba, mut freedives) = (0, 0);
@@ -381,15 +395,28 @@ mod tests {
     }
 
     #[test]
-    fn dives_saved_before_the_extra_fields_read_and_write_back_unchanged() {
-        let json = concat!(
-            r#"{"dives":[{"number":7,"datetime":"2025-08-01T16:03:00","#,
-            r#""duration_seconds":2940,"max_depth_m":31.2,"dive_mode":"air","#,
-            r#""gas_mixes":[{"o2":21}],"samples":[{"time_s":0,"depth_m":2.1,"#,
-            r#""temp_c":27.0},{"time_s":5,"depth_m":3.0,"pressure_bar":201.5}],"#,
-            r#""site":"Blue Hole"}]}"#
+    fn dives_saved_before_read_and_write_back_but_for_the_sirius_number() {
+        let file = |number: &str| {
+            [
+                r#"{"dives":[{"#,
+                number,
+                r#""datetime":"2025-08-01T16:03:00","#,
+                r#""duration_seconds":2940,"max_depth_m":31.2,"dive_mode":"air","#,
+                r#""gas_mixes":[{"o2":21}],"samples":[{"time_s":0,"depth_m":2.1,"#,
+                r#""temp_c":27.0},{"time_s":5,"depth_m":3.0,"pressure_bar":201.5}],"#,
+                r#""site":"Blue Hole"}]}"#,
+            ]
+            .concat()
+        };
+        // The number of the Sirius under its own name
+        let data: DiveData = serde_json::from_str(&file(r#""number":7,"#)).unwrap();
+        assert_eq!(
+            serde_json::to_string(&data).unwrap(),
+            file(r#""sirius_number":7,"#)
         );
-        let data: DiveData = serde_json::from_str(json).unwrap();
-        assert_eq!(serde_json::to_string(&data).unwrap(), json);
+        // 0 stood for a dive the Sirius did not log
+        let data: DiveData = serde_json::from_str(&file(r#""number":0,"#)).unwrap();
+        assert_eq!(data.dives[0].sirius_number, None);
+        assert_eq!(serde_json::to_string(&data).unwrap(), file(""));
     }
 }

@@ -487,7 +487,7 @@ mod tests {
             (dive.samples[0].ndl_min, dive.samples[1].ndl_min),
             (None, Some(66))
         );
-        assert!(dive.number == 0 && dive.dsx_number == Some(300));
+        assert!(dive.sirius_number.is_none() && dive.dsx_number == Some(300));
         assert_eq!(
             (
                 dive.min_temp_c.map(f64::round),
